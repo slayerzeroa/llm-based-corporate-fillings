@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 
 BASE_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 BASE_CORPCODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
+BASE_DOCUMENT_URL = "https://opendart.fss.or.kr/api/document.xml"
 
 
 def _norm_yyyymmdd(s: str) -> str:
@@ -204,6 +205,60 @@ def collect_quarterly_reports(
         df = df.sort_values(["rcept_dt", "stock_code"], ascending=[True, True])
 
     return df.reset_index(drop=True)
+
+
+def _decode_xml_bytes(data: bytes) -> str:
+    for enc in ("utf-8", "euc-kr", "cp949"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def download_document_xml(
+    api_key: str,
+    rcept_no: str,
+    out_dir: str = "dart_documents",
+    extract: bool = True,
+) -> list[str]:
+    """
+    Download original filing XML (zip) by receipt number and extract it.
+    Returns list of extracted file paths (or zip path if extract=False).
+    """
+    params = {
+        "crtfc_key": api_key,
+        "rcept_no": rcept_no,
+    }
+    resp = requests.get(BASE_DOCUMENT_URL, params=params, timeout=30)
+    resp.raise_for_status()
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Try to open as zip (success path)
+    try:
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            if not extract:
+                zip_path = os.path.join(out_dir, f"{rcept_no}.zip")
+                with open(zip_path, "wb") as fp:
+                    fp.write(resp.content)
+                return [zip_path]
+
+            extract_dir = os.path.join(out_dir, rcept_no)
+            os.makedirs(extract_dir, exist_ok=True)
+            zf.extractall(extract_dir)
+            return [os.path.join(extract_dir, name) for name in zf.namelist()]
+    except zipfile.BadZipFile:
+        # Error path: XML message
+        try:
+            xml_text = _decode_xml_bytes(resp.content)
+            root = ET.fromstring(xml_text)
+            status = (root.findtext("status") or "").strip()
+            message = (root.findtext("message") or "").strip()
+        except ET.ParseError:
+            status = ""
+            message = _decode_xml_bytes(resp.content)[:200]
+        raise RuntimeError(f"DART document.xml error: {status} {message}".strip())
 
 
 if __name__ == "__main__":
