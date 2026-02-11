@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from config import load_settings
-from function.filling import collect_quarterly_reports
+from function.filling import collect_quarterly_reports, download_document_xml
 from llm.arranger import arrange_filings
 from llm.providers import OpenAIProvider
 
@@ -34,16 +34,6 @@ def build_provider(
         return OpenAIProvider(
             api_key=settings.openai_api_key,
             model=openai_model or settings.openai_model,
-            temperature=settings.temperature,
-            max_output_tokens=settings.max_output_tokens,
-        )
-
-    if name == "gemini":
-        if not settings.gemini_api_key:
-            raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) is required for Gemini provider.")
-        return GeminiProvider(
-            api_key=settings.gemini_api_key,
-            model=gemini_model or settings.gemini_model,
             temperature=settings.temperature,
             max_output_tokens=settings.max_output_tokens,
         )
@@ -108,8 +98,27 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Fetch and save raw filing metadata only (skip LLM).",
     )
+    parser.add_argument("--download-xml", action="store_true", help="Download DART filing XML by receipt no.")
+    parser.add_argument("--rcept-no", help="Receipt number for DART filing XML download")
+    parser.add_argument("--out-dir", default="dart_documents", help="Output directory for DART XML download")
 
     args = parser.parse_args(argv)
+
+    if args.download_xml and not args.rcept_no:
+        parser.error("--rcept-no is required with --download-xml.")
+
+    if args.download_xml:
+        settings = load_settings()
+        if not settings.dart_api_key:
+            raise RuntimeError("DART API key not found. Set DART_API_KEY or OPENDART_API_KEY.")
+        paths = download_document_xml(
+            api_key=settings.dart_api_key,
+            rcept_no=args.rcept_no,
+            out_dir=args.out_dir,
+            extract=True,
+        )
+        print(f"Downloaded {len(paths)} XML file(s) to {args.out_dir}")
+        return 0
 
     if not args.input_jsonl and (not args.start or not args.end):
         parser.error("--start and --end are required unless --input-jsonl is provided.")
