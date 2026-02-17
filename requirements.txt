@@ -8,3 +8,6 @@ numpy
 networkx
 plotly
 dash
+pykrx
+pymysql
+lxml

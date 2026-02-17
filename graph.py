@@ -1,6 +1,7 @@
 # stock_relationship_3d.py
 import csv
 import os
+import re
 from collections import deque
 from typing import Optional
 
@@ -15,6 +16,122 @@ def _norm_yyyymmdd(s: str) -> str:
     if len(raw) != 8 or not raw.isdigit():
         raise ValueError(f"Invalid date format: {s} (YYYYMMDD or YYYY-MM-DD)")
     return raw
+
+
+def _first_env(*names: str) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _norm_to_date_str(s: str) -> str:
+    ymd = _norm_yyyymmdd(s)
+    return f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+
+
+def _load_graph_input_from_db(
+    *,
+    db_table: str,
+    db_limit: int | None,
+    investor: str | None,
+    stock_code: str | None,
+    corp_code: str | None,
+    fetch_start: str | None,
+    fetch_end: str | None,
+    api_key: str | None,
+) -> pd.DataFrame:
+    import pymysql
+    from dotenv import load_dotenv
+    from config import load_settings
+
+    load_dotenv()
+
+    if not re.fullmatch(r"[A-Za-z0-9_]+", db_table):
+        raise ValueError(f"Invalid table name: {db_table}")
+
+    host = _first_env("DB_HOST")
+    port_raw = _first_env("DB_PORT") or "3306"
+    user = _first_env("DB_USER", "DB_USERNAME")
+    password = _first_env("DB_PASSWORD", "DB_PASS") or ""
+    database = _first_env("DB_NAME", "DB_DATABASE")
+
+    missing = []
+    if not host:
+        missing.append("DB_HOST")
+    if not user:
+        missing.append("DB_USER")
+    if not database:
+        missing.append("DB_NAME")
+    if missing:
+        raise RuntimeError(f"Missing DB env vars: {', '.join(missing)}")
+
+    try:
+        port = int(port_raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid DB_PORT: {port_raw}") from exc
+
+    resolved_corp_code = str(corp_code).strip().zfill(8) if corp_code else None
+    if stock_code:
+        settings = load_settings()
+        use_api_key = (api_key or settings.dart_api_key or "").strip()
+        if not use_api_key:
+            raise RuntimeError("Stock-code DB filter requires DART API key for corp_code mapping.")
+        from function.filling import OpenDartClient
+        dart = OpenDartClient(api_key=use_api_key)
+        mapped_code, mapped_name, mapped_stock = dart.resolve_investor(str(stock_code).strip().zfill(6))
+        resolved_corp_code = str(mapped_code).zfill(8)
+        print(
+            f"[INFO] db filter by stock-code -> corp_code={resolved_corp_code}, "
+            f"corp_name={mapped_name}, stock_code={mapped_stock}"
+        )
+
+    conditions = ["1=1"]
+    params: list[object] = []
+
+    if fetch_start:
+        conditions.append("rcept_dt >= %s")
+        params.append(_norm_to_date_str(fetch_start))
+    if fetch_end:
+        conditions.append("rcept_dt <= %s")
+        params.append(_norm_to_date_str(fetch_end))
+    if resolved_corp_code:
+        conditions.append("corp_code = %s")
+        params.append(resolved_corp_code)
+    if investor:
+        conditions.append("corp_name LIKE %s")
+        params.append(f"%{str(investor).strip()}%")
+
+    sql = f"""
+    SELECT
+        rcept_no, rcept_dt, corp_cls, corp_code, report_nm, flr_nm, pblntf_ty,
+        source, viewer_url, corp_name, iscmp_cmpnm, trfdtl_trfprc, trfdtl_stkcnt, trf_pp
+    FROM {db_table}
+    WHERE {' AND '.join(conditions)}
+    ORDER BY rcept_dt DESC, rcept_no DESC
+    """
+    if db_limit is not None and db_limit > 0:
+        sql += " LIMIT %s"
+        params.append(int(db_limit))
+
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return pd.DataFrame(rows)
 
 
 def _prepare_graph_input_csv(
@@ -32,9 +149,33 @@ def _prepare_graph_input_csv(
     include_majorstock_status: bool,
     include_transfer_note_plan: bool,
     max_note_reports: int,
+    db_table: str,
+    db_limit: int | None,
 ) -> str:
     if input_source == "csv":
         return csv_path
+
+    if input_source == "db":
+        df = _load_graph_input_from_db(
+            db_table=db_table,
+            db_limit=db_limit,
+            investor=investor,
+            stock_code=stock_code,
+            corp_code=corp_code,
+            fetch_start=fetch_start,
+            fetch_end=fetch_end,
+            api_key=api_key,
+        )
+        if df.empty:
+            raise ValueError("DB query returned an empty dataframe.")
+
+        out_csv = csv_path or "./data/holdings_graph_input_db.csv"
+        out_dir = os.path.dirname(out_csv)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+        print(f"[INFO] db rows={len(df):,} saved -> {out_csv}")
+        return out_csv
 
     from config import load_settings
     from function import CorporateHoldingsModule
@@ -182,14 +323,33 @@ def _read_transfer_csv_robust(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def _aggregate_edges(df: pd.DataFrame, max_edges: int) -> pd.DataFrame:
+def _aggregate_edges(
+    df: pd.DataFrame,
+    max_edges: int | None,
+    pinned_node: str | None = None,
+) -> pd.DataFrame:
     edges = (
         df.groupby(["corp_name", "iscmp_cmpnm"], as_index=False)["amount_abs"]
         .sum()
         .rename(columns={"corp_name": "src", "iscmp_cmpnm": "dst", "amount_abs": "weight"})
     )
-    if len(edges) > max_edges:
-        edges = edges.nlargest(max_edges, "weight").copy()
+    if max_edges is None or max_edges <= 0 or len(edges) <= max_edges:
+        return edges
+
+    if pinned_node:
+        pinned_node = str(pinned_node).strip()
+        pin_mask = (edges["src"] == pinned_node) | (edges["dst"] == pinned_node)
+        pin_edges = edges[pin_mask].copy()
+        if len(pin_edges) >= max_edges:
+            return pin_edges.nlargest(max_edges, "weight").copy()
+
+        remain = int(max_edges - len(pin_edges))
+        top_others = edges[~pin_mask].nlargest(remain, "weight").copy()
+        edges = pd.concat([pin_edges, top_others], ignore_index=True)
+        edges = edges.drop_duplicates(subset=["src", "dst"], keep="first")
+        return edges.reset_index(drop=True)
+
+    edges = edges.nlargest(max_edges, "weight").copy()
     return edges
 
 
@@ -256,6 +416,13 @@ def _filter_by_date_range(
 
 
 def _resolve_highlight_node(all_nodes: list[str], query: str | None) -> str | None:
+    def _norm_name(x: str) -> str:
+        s = str(x).strip().lower()
+        s = s.replace("(주)", "").replace("㈜", "").replace("주식회사", "")
+        s = s.replace("co.,ltd.", "").replace("co., ltd.", "").replace("corporation", "")
+        s = re.sub(r"[^0-9a-zA-Z가-힣]", "", s)
+        return s
+
     if not query:
         return None
     q = query.strip().lower()
@@ -269,6 +436,22 @@ def _resolve_highlight_node(all_nodes: list[str], query: str | None) -> str | No
     contains = [n for n in all_nodes if q in str(n).strip().lower()]
     if contains:
         return contains[0]
+
+    reverse_contains = [n for n in all_nodes if str(n).strip().lower() in q]
+    if reverse_contains:
+        return reverse_contains[0]
+
+    nq = _norm_name(q)
+    if nq:
+        normalized_map = [(n, _norm_name(str(n))) for n in all_nodes]
+
+        norm_exact = [n for n, nn in normalized_map if nn == nq]
+        if norm_exact:
+            return norm_exact[0]
+
+        norm_contains = [n for n, nn in normalized_map if nq in nn or nn in nq]
+        if norm_contains:
+            return norm_contains[0]
 
     return None
 
@@ -452,7 +635,20 @@ def _build_figure_for_filtered_df(
         )
         return fig, pd.DataFrame(columns=["src", "dst", "weight"]), None
 
-    edges = _aggregate_edges(dsub, max_edges=max_edges)
+    full_edges = _aggregate_edges(dsub, max_edges=None)
+    if full_edges.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{title_prefix} | No edge data in selected window",
+            height=850,
+            margin=dict(l=0, r=0, t=80, b=0),
+        )
+        return fig, pd.DataFrame(columns=["src", "dst", "weight"]), None
+
+    all_nodes = sorted(set(full_edges["src"]).union(set(full_edges["dst"])))
+    selected = _resolve_highlight_node(all_nodes, highlight_stock)
+
+    edges = _aggregate_edges(dsub, max_edges=max_edges, pinned_node=selected)
     if edges.empty:
         fig = go.Figure()
         fig.update_layout(
@@ -468,8 +664,6 @@ def _build_figure_for_filtered_df(
 
     pos = nx.spring_layout(G, dim=3, seed=42, weight="weight")
     reporting_set = set(dsub["corp_name"].unique())
-    all_nodes = list(G.nodes())
-    selected = _resolve_highlight_node(all_nodes, highlight_stock)
 
     traces, subtitle = _build_snapshot_traces(
         edges=edges,
@@ -519,8 +713,17 @@ def build_stock_relationship_3d(
     df = _prepare_network_dataframe(csv_path, only_last_1y=only_last_1y)
     df = _filter_by_date_range(df, start_date=start_date, end_date=end_date)
 
-    # Build full graph once for stable coordinates and stock search target resolution.
-    full_edges = _aggregate_edges(df, max_edges=max_edges)
+    # Build all edges once for search resolution, then cap displayed edges.
+    all_edges = _aggregate_edges(df, max_edges=None)
+    if all_edges.empty:
+        raise ValueError("No edge data available.")
+
+    all_nodes = sorted(set(all_edges["src"]).union(set(all_edges["dst"])))
+    selected_node = _resolve_highlight_node(all_nodes, highlight_stock)
+    if highlight_stock and not selected_node:
+        print(f"[WARN] highlight_stock '{highlight_stock}' not found. Highlight disabled.")
+
+    full_edges = _aggregate_edges(df, max_edges=max_edges, pinned_node=selected_node)
     if full_edges.empty:
         raise ValueError("No edge data available.")
 
@@ -532,11 +735,6 @@ def build_stock_relationship_3d(
 
     pos = nx.spring_layout(G_full, dim=3, seed=42, weight="weight")
     reporting_set = set(df["corp_name"].unique())
-    all_nodes = list(G_full.nodes())
-
-    selected_node = _resolve_highlight_node(all_nodes, highlight_stock)
-    if highlight_stock and not selected_node:
-        print(f"[WARN] highlight_stock '{highlight_stock}' not found. Highlight disabled.")
 
     # Build snapshots (optional)
     snapshots = []
@@ -550,7 +748,7 @@ def build_stock_relationship_3d(
                 dsub = df[df["rcept_dt"].dt.date <= day].copy()
             else:
                 dsub = df[df["rcept_dt"].dt.date == day].copy()
-            edges = _aggregate_edges(dsub, max_edges=max_edges)
+            edges = _aggregate_edges(dsub, max_edges=max_edges, pinned_node=selected_node)
             if edges.empty:
                 continue
             label = str(day)
@@ -780,7 +978,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["dashboard", "static"], default="dashboard")
-    parser.add_argument("--input-source", choices=["csv", "module"], default="module")
+    parser.add_argument("--input-source", choices=["csv", "module", "db"], default="module")
     parser.add_argument("--csv-path", default="./sample_transfer_1y.csv")
     parser.add_argument("--out-html", default="./stock_relationship_3d.html")
     parser.add_argument("--max-edges", type=int, default=80)
@@ -798,6 +996,8 @@ if __name__ == "__main__":
     parser.add_argument("--include-majorstock-status", action="store_true", help="Include majorstock status proxy data")
     parser.add_argument("--exclude-note-plan", action="store_true", help="Disable note-plan extraction")
     parser.add_argument("--max-note-reports", type=int, default=200)
+    parser.add_argument("--db-table", default="dart_investment_events")
+    parser.add_argument("--db-limit", type=int, default=None)
     parser.add_argument("--snapshot-nav", action="store_true", help="Enable one-date snapshot slider navigation")
     parser.add_argument("--highlight-stock", default="SK")
     parser.add_argument("--highlight-hops", type=int, default=1)
@@ -823,6 +1023,8 @@ if __name__ == "__main__":
         include_majorstock_status=args.include_majorstock_status,
         include_transfer_note_plan=not args.exclude_note_plan,
         max_note_reports=args.max_note_reports,
+        db_table=args.db_table,
+        db_limit=args.db_limit,
     )
 
     if args.mode == "dashboard":

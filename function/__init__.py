@@ -13,6 +13,7 @@ from function.corporate_holdings import (
     list_all_pages,
     select_graph_and_metadata_columns,
 )
+from function.krx_api import KrxApiClient
 
 __all__ = [
     "CorporateHoldingsModule",
@@ -26,4 +27,5 @@ __all__ = [
     "fetch_transfer_list_standalone",
     "extract_transfer_decision_from_viewer_url",
     "select_graph_and_metadata_columns",
+    "KrxApiClient",
 ]
