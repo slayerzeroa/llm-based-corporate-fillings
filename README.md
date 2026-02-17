@@ -20,7 +20,7 @@ pip install -r server/requirements.txt
 python server/run.py
 ```
 
-- API: `http://127.0.0.1:8000`
+- API: `http://127.0.0.1:5623`
 - 사용 env: `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_TABLE`
 
 ### 2) 프론트 실행 (`client/`)
@@ -31,4 +31,4 @@ npm run dev
 ```
 
 - UI: `http://127.0.0.1:5173`
-- Vite proxy로 `/api`는 서버(`:8000`)로 전달됨
+- Vite proxy로 `/api`는 서버(`:5623`)로 전달됨

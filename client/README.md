@@ -13,5 +13,4 @@ npm run dev
 
 Frontend: `http://127.0.0.1:5173`
 
-`/api` requests are proxied to `http://127.0.0.1:8000`.
-
+`/api` requests are proxied to `http://127.0.0.1:5623`.

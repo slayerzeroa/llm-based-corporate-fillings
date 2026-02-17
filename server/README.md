@@ -20,7 +20,7 @@ Root `.env` should include:
 python server/run.py
 ```
 
-API base: `http://127.0.0.1:8000`
+API base: `http://127.0.0.1:5623`
 
 운영용 권장 env:
 - `APP_RELOAD=false`
