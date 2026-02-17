@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
+from collections import OrderedDict
+from threading import Lock
+import time
 
 import networkx as nx
 import numpy as np
@@ -14,6 +17,43 @@ from .db import get_connection
 from .schemas import GraphQuery, GraphResponse, TopEdge
 
 SYSTEM_MAX_EDGES = 50
+GRAPH_CACHE_TTL_SEC = 20
+GRAPH_CACHE_MAX_ITEMS = 256
+STOCK_CACHE_TTL_SEC = 60
+STOCK_CACHE_MAX_ITEMS = 256
+
+
+class _TTLCache:
+    def __init__(self, max_items: int, ttl_sec: int) -> None:
+        self.max_items = max(int(max_items), 1)
+        self.ttl_sec = max(int(ttl_sec), 1)
+        self._store: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
+        self._lock = Lock()
+
+    def get(self, key: tuple) -> object | None:
+        now = time.time()
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            expires_at, value = item
+            if now >= expires_at:
+                self._store.pop(key, None)
+                return None
+            self._store.move_to_end(key)
+            return value
+
+    def set(self, key: tuple, value: object) -> None:
+        now = time.time()
+        with self._lock:
+            self._store[key] = (now + self.ttl_sec, value)
+            self._store.move_to_end(key)
+            while len(self._store) > self.max_items:
+                self._store.popitem(last=False)
+
+
+_GRAPH_CACHE = _TTLCache(max_items=GRAPH_CACHE_MAX_ITEMS, ttl_sec=GRAPH_CACHE_TTL_SEC)
+_STOCK_CACHE = _TTLCache(max_items=STOCK_CACHE_MAX_ITEMS, ttl_sec=STOCK_CACHE_TTL_SEC)
 
 
 def _norm_yyyymmdd(value: str) -> str:
@@ -34,6 +74,200 @@ def _norm_name(text: str) -> str:
     s = s.replace("co.,ltd.", "").replace("co., ltd.", "").replace("corporation", "")
     s = re.sub(r"[^0-9a-zA-Z가-힣]", "", s)
     return s
+
+
+def _build_base_where(
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    snapshot_date: str | None,
+    include_periodic_status: bool,
+    include_majorstock_status: bool,
+) -> tuple[str, list[object]]:
+    conditions = [
+        "rcept_dt IS NOT NULL",
+        "corp_name IS NOT NULL",
+        "iscmp_cmpnm IS NOT NULL",
+        "TRIM(corp_name) <> ''",
+        "TRIM(iscmp_cmpnm) <> ''",
+        "corp_name <> iscmp_cmpnm",
+        "REPLACE(TRIM(iscmp_cmpnm), ' ', '') NOT IN ('합계','총계','소계')",
+    ]
+    params: list[object] = []
+
+    if start_date:
+        conditions.append("rcept_dt >= %s")
+        params.append(_to_date_str(start_date))
+    if end_date:
+        conditions.append("rcept_dt <= %s")
+        params.append(_to_date_str(end_date))
+    if snapshot_date:
+        conditions.append("rcept_dt <= %s")
+        params.append(_to_date_str(snapshot_date))
+
+    if not include_periodic_status:
+        conditions.append("(source IS NULL OR source NOT LIKE %s)")
+        params.append("%OTRCPR_INVSTMNT_STTUS%")
+    if not include_majorstock_status:
+        conditions.append("(source IS NULL OR source NOT LIKE %s)")
+        params.append("%MAJORSTOCK_STKQY_PROXY%")
+
+    return " AND ".join(conditions), params
+
+
+def _query_snapshot_dates(query: GraphQuery, settings: ServerSettings) -> list[str]:
+    where_sql, params = _build_base_where(
+        start_date=query.start_date,
+        end_date=query.end_date,
+        snapshot_date=None,
+        include_periodic_status=query.include_periodic_status,
+        include_majorstock_status=query.include_majorstock_status,
+    )
+    sql = f"""
+    SELECT DISTINCT rcept_dt
+    FROM {settings.db_table}
+    WHERE {where_sql}
+    ORDER BY rcept_dt ASC
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    out = []
+    for row in rows:
+        dt = row.get("rcept_dt")
+        if dt is None:
+            continue
+        out.append(str(pd.to_datetime(dt).date()))
+    return out
+
+
+def _build_base_event_subquery(
+    query: GraphQuery,
+    settings: ServerSettings,
+    *,
+    snapshot_date: str,
+) -> tuple[str, list[object]]:
+    where_sql, params = _build_base_where(
+        start_date=query.start_date,
+        end_date=query.end_date,
+        snapshot_date=snapshot_date,
+        include_periodic_status=query.include_periodic_status,
+        include_majorstock_status=query.include_majorstock_status,
+    )
+    if query.db_limit is not None and query.db_limit > 0:
+        sub_sql = f"""
+        SELECT
+            corp_name,
+            iscmp_cmpnm,
+            trfdtl_trfprc,
+            rcept_dt,
+            rcept_no
+        FROM {settings.db_table}
+        WHERE {where_sql}
+        ORDER BY rcept_dt ASC, rcept_no ASC
+        LIMIT %s
+        """
+        return sub_sql, params + [int(query.db_limit)]
+
+    sub_sql = f"""
+    SELECT
+        corp_name,
+        iscmp_cmpnm,
+        trfdtl_trfprc,
+        rcept_dt,
+        rcept_no
+    FROM {settings.db_table}
+    WHERE {where_sql}
+    """
+    return sub_sql, params
+
+
+def _query_aggregated_edges(
+    query: GraphQuery,
+    settings: ServerSettings,
+    *,
+    snapshot_date: str,
+    node_filter: set[str] | None = None,
+) -> pd.DataFrame:
+    sub_sql, sub_params = _build_base_event_subquery(query, settings, snapshot_date=snapshot_date)
+    where_extra = ""
+    params = list(sub_params)
+    if node_filter:
+        nodes = sorted(node_filter)
+        placeholders = ",".join(["%s"] * len(nodes))
+        where_extra = f"WHERE src IN ({placeholders}) AND dst IN ({placeholders})"
+        params.extend(nodes)
+        params.extend(nodes)
+
+    sql = f"""
+    SELECT
+        src,
+        dst,
+        SUM(weight_abs) AS weight
+    FROM (
+        SELECT
+            corp_name AS src,
+            iscmp_cmpnm AS dst,
+            ABS(COALESCE(CAST(trfdtl_trfprc AS DECIMAL(24, 6)), 0)) AS weight_abs
+        FROM ({sub_sql}) base
+    ) e
+    {where_extra}
+    GROUP BY src, dst
+    """
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    edges = pd.DataFrame(rows)
+    if edges.empty:
+        return pd.DataFrame(columns=["src", "dst", "weight"])
+    edges["src"] = edges["src"].astype(str)
+    edges["dst"] = edges["dst"].astype(str)
+    edges["weight"] = pd.to_numeric(edges["weight"], errors="coerce").fillna(0.0)
+    return edges
+
+
+def _query_row_count(
+    query: GraphQuery,
+    settings: ServerSettings,
+    *,
+    snapshot_date: str,
+    node_filter: set[str] | None = None,
+) -> int:
+    sub_sql, sub_params = _build_base_event_subquery(query, settings, snapshot_date=snapshot_date)
+    params = list(sub_params)
+    where_extra = ""
+    if node_filter:
+        nodes = sorted(node_filter)
+        placeholders = ",".join(["%s"] * len(nodes))
+        where_extra = f"WHERE corp_name IN ({placeholders}) AND iscmp_cmpnm IN ({placeholders})"
+        params.extend(nodes)
+        params.extend(nodes)
+
+    sql = f"""
+    SELECT COUNT(*) AS cnt
+    FROM ({sub_sql}) base
+    {where_extra}
+    """
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            row = cur.fetchone() or {"cnt": 0}
+    finally:
+        conn.close()
+    return int(row.get("cnt", 0) or 0)
 
 
 def _resolve_highlight_node(all_nodes: list[str], query: str | None) -> str | None:
@@ -61,21 +295,19 @@ def _resolve_highlight_node(all_nodes: list[str], query: str | None) -> str | No
         norm_exact = [n for n, nn in normalized if nn == nq]
         if norm_exact:
             return norm_exact[0]
-        norm_contains = [n for n, nn in normalized if nq in nn or nn in nq]
+        norm_contains = [n for n, nn in normalized if nq and nn and (nq in nn or nn in nq)]
         if norm_contains:
             return norm_contains[0]
 
     return None
 
 
-def _aggregate_edges(df: pd.DataFrame, max_edges: int | None, pinned_node: str | None = None) -> pd.DataFrame:
-    edges = (
-        df.groupby(["corp_name", "iscmp_cmpnm"], as_index=False)["amount_abs"]
-        .sum()
-        .rename(columns={"corp_name": "src", "iscmp_cmpnm": "dst", "amount_abs": "weight"})
-    )
+def _aggregate_edges(edges: pd.DataFrame, max_edges: int | None, pinned_node: str | None = None) -> pd.DataFrame:
+    if edges is None or edges.empty:
+        return pd.DataFrame(columns=["src", "dst", "weight"])
+
     if max_edges is None or max_edges <= 0 or len(edges) <= max_edges:
-        return edges
+        return edges.copy()
 
     if pinned_node:
         pin_mask = (edges["src"] == pinned_node) | (edges["dst"] == pinned_node)
@@ -253,74 +485,29 @@ def _build_figure_json(
     return json.loads(fig.to_json())
 
 
-def _load_events_from_db(query: GraphQuery, settings: ServerSettings) -> pd.DataFrame:
-    conditions = ["1=1"]
-    params: list[object] = []
-
-    if query.start_date:
-        conditions.append("rcept_dt >= %s")
-        params.append(_to_date_str(query.start_date))
-    if query.end_date:
-        conditions.append("rcept_dt <= %s")
-        params.append(_to_date_str(query.end_date))
-
-    sql = f"""
-    SELECT
-        rcept_no, rcept_dt, corp_cls, corp_code, report_nm, flr_nm, pblntf_ty,
-        source, viewer_url, corp_name, iscmp_cmpnm, trfdtl_trfprc, trfdtl_stkcnt, trf_pp
-    FROM {settings.db_table}
-    WHERE {' AND '.join(conditions)}
-    ORDER BY rcept_dt ASC, rcept_no ASC
-    """
-    if query.db_limit is not None and query.db_limit > 0:
-        sql += " LIMIT %s"
-        params.append(int(query.db_limit))
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    return pd.DataFrame(rows)
-
-
-def _preprocess(df: pd.DataFrame, include_periodic: bool, include_majorstock: bool) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    out = df.copy()
-    out["rcept_dt"] = pd.to_datetime(out["rcept_dt"], errors="coerce")
-    out = out.dropna(subset=["rcept_dt"]).copy()
-    out["amount_abs"] = pd.to_numeric(out["trfdtl_trfprc"], errors="coerce").abs().fillna(0)
-    out["corp_name"] = out["corp_name"].astype(str).str.strip()
-    out["iscmp_cmpnm"] = out["iscmp_cmpnm"].astype(str).str.strip()
-
-    if "source" in out.columns:
-        if not include_periodic:
-            out = out[~out["source"].astype(str).str.contains("OTRCPR_INVSTMNT_STTUS", na=False)].copy()
-        if not include_majorstock:
-            out = out[~out["source"].astype(str).str.contains("MAJORSTOCK_STKQY_PROXY", na=False)].copy()
-
-    out = out[~out["iscmp_cmpnm"].str.replace(r"\s+", "", regex=True).isin(["합계", "총계", "소계"])].copy()
-    out = out[(out["corp_name"] != "") & (out["iscmp_cmpnm"] != "")].copy()
-    out = out[out["corp_name"] != out["iscmp_cmpnm"]].copy()
-    return out.reset_index(drop=True)
-
-
 def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphResponse:
-    raw = _load_events_from_db(query, settings)
-    df = _preprocess(
-        raw,
-        include_periodic=query.include_periodic_status,
-        include_majorstock=query.include_majorstock_status,
+    effective_max_edges = max(1, min(int(query.max_edges), SYSTEM_MAX_EDGES))
+    cache_key = (
+        settings.db_table,
+        query.start_date,
+        query.end_date,
+        query.snapshot_date,
+        query.search_stock,
+        int(query.highlight_hops),
+        effective_max_edges,
+        query.db_limit,
+        bool(query.include_periodic_status),
+        bool(query.include_majorstock_status),
     )
-    if df.empty:
+    cached = _GRAPH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    snapshot_dates = _query_snapshot_dates(query, settings)
+    if not snapshot_dates:
         empty_fig = go.Figure()
         empty_fig.update_layout(title="No data in selected range", height=850)
-        return GraphResponse(
+        response = GraphResponse(
             snapshot_dates=[],
             snapshot_date=None,
             selected_stock=None,
@@ -330,36 +517,60 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
             figure=json.loads(empty_fig.to_json()),
             top_edges=[],
         )
+        _GRAPH_CACHE.set(cache_key, response)
+        return response
 
-    snapshot_dates = sorted(df["rcept_dt"].dt.date.dropna().unique())
     snapshot_date = snapshot_dates[-1]
     if query.snapshot_date:
         req = pd.to_datetime(query.snapshot_date, errors="coerce")
         if pd.isna(req):
             raise ValueError(f"Invalid snapshot_date: {query.snapshot_date}")
         req_date = req.date()
-        candidates = [d for d in snapshot_dates if d <= req_date]
+        candidates = [pd.to_datetime(d).date() for d in snapshot_dates if pd.to_datetime(d).date() <= req_date]
         snapshot_date = candidates[-1] if candidates else snapshot_dates[0]
+    snapshot_date = str(snapshot_date)
 
-    dsub = df[df["rcept_dt"].dt.date <= snapshot_date].copy()
-    all_edges = _aggregate_edges(dsub, max_edges=None)
+    all_edges = _query_aggregated_edges(
+        query=query,
+        settings=settings,
+        snapshot_date=snapshot_date,
+        node_filter=None,
+    )
+    if all_edges.empty:
+        empty_fig = go.Figure()
+        empty_fig.update_layout(title="No data in selected range", height=850)
+        response = GraphResponse(
+            snapshot_dates=snapshot_dates,
+            snapshot_date=snapshot_date,
+            selected_stock=None,
+            rows=0,
+            edges_shown=0,
+            status_text="No data in selected range.",
+            figure=json.loads(empty_fig.to_json()),
+            top_edges=[],
+        )
+        _GRAPH_CACHE.set(cache_key, response)
+        return response
 
     all_nodes = sorted(set(all_edges["src"]).union(set(all_edges["dst"])))
     selected = _resolve_highlight_node(all_nodes, query.search_stock)
+    keep_nodes: set[str] | None = None
 
     if selected:
         keep_nodes = _k_hop_nodes_from_edges(all_edges, selected, query.highlight_hops)
         if keep_nodes:
-            dsub = dsub[
-                dsub["corp_name"].isin(keep_nodes) & dsub["iscmp_cmpnm"].isin(keep_nodes)
-            ].copy()
             all_edges = all_edges[
                 all_edges["src"].isin(keep_nodes) & all_edges["dst"].isin(keep_nodes)
             ].copy()
 
-    effective_max_edges = max(1, min(int(query.max_edges), SYSTEM_MAX_EDGES))
-    edges = _aggregate_edges(dsub, max_edges=effective_max_edges, pinned_node=selected)
-    reporting_set = set(dsub["corp_name"].unique())
+    edges = _aggregate_edges(all_edges, max_edges=effective_max_edges, pinned_node=selected)
+    rows_count = _query_row_count(
+        query=query,
+        settings=settings,
+        snapshot_date=snapshot_date,
+        node_filter=keep_nodes if selected else None,
+    )
+    reporting_set = set(edges["src"].astype(str).unique()) if not edges.empty else set()
     title = f"Stock Relationship 3D Network | As-Of Snapshot Date: {snapshot_date}"
     if selected:
         title += f" | Highlight: {selected} (hop <= {query.highlight_hops})"
@@ -374,12 +585,12 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
 
     if query.search_stock and not selected:
         status = (
-            f"As-Of Snapshot Date: {snapshot_date} | Rows: {len(dsub):,} | "
+            f"As-Of Snapshot Date: {snapshot_date} | Rows: {rows_count:,} | "
             f"Edges shown: {len(edges):,} | stock search '{query.search_stock}' not found"
         )
     else:
         status = (
-            f"As-Of Snapshot Date: {snapshot_date} | Rows: {len(dsub):,} | "
+            f"As-Of Snapshot Date: {snapshot_date} | Rows: {rows_count:,} | "
             f"Edges shown: {len(edges):,}" + (f" | Highlight: {selected}" if selected else "")
         )
 
@@ -389,16 +600,18 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
         for _, r in top.iterrows()
     ]
 
-    return GraphResponse(
+    response = GraphResponse(
         snapshot_dates=[str(x) for x in snapshot_dates],
-        snapshot_date=str(snapshot_date),
+        snapshot_date=snapshot_date,
         selected_stock=selected,
-        rows=int(len(dsub)),
+        rows=int(rows_count),
         edges_shown=int(len(edges)),
         status_text=status,
         figure=figure,
         top_edges=top_edges,
     )
+    _GRAPH_CACHE.set(cache_key, response)
+    return response
 
 
 def list_stock_options(
@@ -411,20 +624,58 @@ def list_stock_options(
     include_majorstock_status: bool,
     settings: ServerSettings,
 ) -> list[str]:
-    query = GraphQuery(
+    cache_key = (
+        settings.db_table,
+        start_date,
+        end_date,
+        q or "",
+        int(limit),
+        bool(include_periodic_status),
+        bool(include_majorstock_status),
+    )
+    cached = _STOCK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    where_sql, params = _build_base_where(
         start_date=start_date,
         end_date=end_date,
-        db_limit=None,
+        snapshot_date=None,
         include_periodic_status=include_periodic_status,
         include_majorstock_status=include_majorstock_status,
     )
-    raw = _load_events_from_db(query, settings)
-    df = _preprocess(raw, include_periodic_status, include_majorstock_status)
-    if df.empty:
-        return []
 
-    nodes = sorted(set(df["corp_name"].astype(str).tolist()) | set(df["iscmp_cmpnm"].astype(str).tolist()))
+    sql = f"""
+    SELECT name FROM (
+        SELECT TRIM(corp_name) AS name
+        FROM {settings.db_table}
+        WHERE {where_sql}
+        UNION DISTINCT
+        SELECT TRIM(iscmp_cmpnm) AS name
+        FROM {settings.db_table}
+        WHERE {where_sql}
+    ) u
+    WHERE name IS NOT NULL AND name <> ''
+    ORDER BY name ASC
+    LIMIT %s
+    """
+    query_params = list(params) + list(params) + [max(int(limit) * 4, int(limit), 1)]
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(query_params))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    nodes = [str(r.get("name", "")).strip() for r in rows if str(r.get("name", "")).strip()]
     if q and q.strip():
         nq = _norm_name(q)
-        nodes = [n for n in nodes if nq in _norm_name(n) or _norm_name(n) in nq]
-    return nodes[: max(limit, 1)]
+        nodes = [
+            n for n in nodes
+            if nq and _norm_name(n) and (nq in _norm_name(n) or _norm_name(n) in nq)
+        ]
+    result = nodes[: max(limit, 1)]
+    _STOCK_CACHE.set(cache_key, result)
+    return result

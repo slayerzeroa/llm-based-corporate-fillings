@@ -84,6 +84,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const t = setTimeout(() => {
+      loadStocks(searchStock);
+    }, 250);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchStock, startDate, endDate]);
+
   const onRefresh = async () => {
     await loadGraph();
   };
@@ -93,10 +101,14 @@ export default function App() {
     await loadStocks(searchStock);
   };
 
-  const onSnapshotChange = async (nextIndex) => {
+  const onSnapshotChange = (nextIndex) => {
     const idx = Number(nextIndex);
     setSnapshotIndex(idx);
+  };
+
+  const onSnapshotCommit = async () => {
     if (!snapshotDates.length) return;
+    const idx = Math.max(0, Math.min(snapshotIndex, snapshotDates.length - 1));
     await loadGraph({ snapshotDate: snapshotDates[idx] });
   };
 
@@ -149,11 +161,7 @@ export default function App() {
             <input
               list="stock-options"
               value={searchStock}
-              onChange={(e) => {
-                const v = e.target.value;
-                setSearchStock(v);
-                if (v.length >= 1) loadStocks(v);
-              }}
+              onChange={(e) => setSearchStock(e.target.value)}
               placeholder="회사명을 입력하세요"
             />
             <datalist id="stock-options">
@@ -188,6 +196,9 @@ export default function App() {
               step={1}
               value={Math.min(snapshotIndex, Math.max(snapshotDates.length - 1, 0))}
               onChange={(e) => onSnapshotChange(e.target.value)}
+              onMouseUp={onSnapshotCommit}
+              onTouchEnd={onSnapshotCommit}
+              onKeyUp={onSnapshotCommit}
               disabled={!snapshotDates.length || loading}
             />
             <div className="snapshot-label">

@@ -454,7 +454,7 @@ def _resolve_highlight_node(all_nodes: list[str], query: str | None) -> str | No
         if norm_exact:
             return norm_exact[0]
 
-        norm_contains = [n for n, nn in normalized_map if nq in nn or nn in nq]
+        norm_contains = [n for n, nn in normalized_map if nq and nn and (nq in nn or nn in nq)]
         if norm_contains:
             return norm_contains[0]
 

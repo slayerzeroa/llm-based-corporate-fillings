@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from .config import get_settings
 from .graph_service import build_graph_response, list_stock_options
@@ -11,6 +12,7 @@ from .schemas import GraphQuery, GraphResponse, StockOptionsResponse
 settings = get_settings()
 
 app = FastAPI(title="Stock Relationship API", version="1.0.0")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -59,4 +61,3 @@ def stocks(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Internal error: {exc}") from exc
     return StockOptionsResponse(stocks=items)
-

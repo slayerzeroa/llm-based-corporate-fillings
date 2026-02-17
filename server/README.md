@@ -22,3 +22,6 @@ python server/run.py
 
 API base: `http://127.0.0.1:8000`
 
+운영용 권장 env:
+- `APP_RELOAD=false`
+- `APP_WORKERS=2`
