@@ -4,3 +4,7 @@ openai
 google-genai
 pandas
 beautifulsoup4
+numpy
+networkx
+plotly
+dash

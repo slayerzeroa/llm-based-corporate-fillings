@@ -267,5 +267,7 @@ if __name__ == "__main__":
     # 예시: 2026년 2월
     df = fetch_kind_ir_calendar(2026, 2)
     print(df.head(20))
-    df.to_csv("kind_ir_calendar_2026_02.csv", index=False, encoding="utf-8-sig")
+    import os
+    os.makedirs("data", exist_ok=True)
+    df.to_csv("data/kind_ir_calendar_2026_02.csv", index=False, encoding="utf-8-sig")
     print("saved:", len(df), "rows")

@@ -74,6 +74,7 @@ def _fetch_filings_from_dart(
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False))
@@ -89,7 +90,7 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--include-halfyear", action="store_true", help="Include half-year reports")
     parser.add_argument("--markets", default="Y,K,N", help="Comma-separated corp_cls codes")
     parser.add_argument("--limit", type=int, help="Max number of filings to process")
-    parser.add_argument("--out", default="arranged_filings.jsonl", help="Output JSONL file")
+    parser.add_argument("--out", default="data/arranged_filings.jsonl", help="Output JSONL file")
     parser.add_argument("--openai-model", help="Override OpenAI model")
     parser.add_argument("--gemini-model", help="Override Gemini model")
     parser.add_argument("--input-jsonl", help="Input JSONL file with filing metadata")
@@ -100,7 +101,7 @@ def run_cli(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument("--download-xml", action="store_true", help="Download DART filing XML by receipt no.")
     parser.add_argument("--rcept-no", help="Receipt number for DART filing XML download")
-    parser.add_argument("--out-dir", default="dart_documents", help="Output directory for DART XML download")
+    parser.add_argument("--out-dir", default="data/dart_documents", help="Output directory for DART XML download")
 
     args = parser.parse_args(argv)
 
