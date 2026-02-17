@@ -13,6 +13,8 @@ from .config import ServerSettings
 from .db import get_connection
 from .schemas import GraphQuery, GraphResponse, TopEdge
 
+SYSTEM_MAX_EDGES = 50
+
 
 def _norm_yyyymmdd(value: str) -> str:
     raw = str(value).replace("-", "").strip()
@@ -106,6 +108,17 @@ def _related_nodes_undirected(graph: nx.Graph, center: str, hops: int) -> set[st
     return seen
 
 
+def _k_hop_nodes_from_edges(edges: pd.DataFrame, center: str | None, hops: int) -> set[str]:
+    if edges.empty or not center:
+        return set()
+    g = nx.Graph()
+    for _, row in edges.iterrows():
+        g.add_edge(str(row["src"]), str(row["dst"]))
+    # When searching, keep at least direct neighbors (hop=1) to avoid empty graph.
+    use_hops = max(int(hops), 1)
+    return _related_nodes_undirected(g, center, use_hops)
+
+
 def _build_figure_json(
     edges: pd.DataFrame,
     reporting_set: set[str],
@@ -124,7 +137,7 @@ def _build_figure_json(
 
     pos = nx.spring_layout(graph, dim=3, seed=42, weight="weight")
     undirected = graph.to_undirected()
-    related = _related_nodes_undirected(undirected, selected, max(highlight_hops, 0)) if selected else set()
+    related = _related_nodes_undirected(undirected, selected, max(highlight_hops, 1)) if selected else set()
 
     def _rgba(hex_color: str, alpha: float) -> str:
         h = hex_color.lstrip("#")
@@ -334,7 +347,18 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
     all_nodes = sorted(set(all_edges["src"]).union(set(all_edges["dst"])))
     selected = _resolve_highlight_node(all_nodes, query.search_stock)
 
-    edges = _aggregate_edges(dsub, max_edges=query.max_edges, pinned_node=selected)
+    if selected:
+        keep_nodes = _k_hop_nodes_from_edges(all_edges, selected, query.highlight_hops)
+        if keep_nodes:
+            dsub = dsub[
+                dsub["corp_name"].isin(keep_nodes) & dsub["iscmp_cmpnm"].isin(keep_nodes)
+            ].copy()
+            all_edges = all_edges[
+                all_edges["src"].isin(keep_nodes) & all_edges["dst"].isin(keep_nodes)
+            ].copy()
+
+    effective_max_edges = max(1, min(int(query.max_edges), SYSTEM_MAX_EDGES))
+    edges = _aggregate_edges(dsub, max_edges=effective_max_edges, pinned_node=selected)
     reporting_set = set(dsub["corp_name"].unique())
     title = f"Stock Relationship 3D Network | As-Of Snapshot Date: {snapshot_date}"
     if selected:
@@ -404,4 +428,3 @@ def list_stock_options(
         nq = _norm_name(q)
         nodes = [n for n in nodes if nq in _norm_name(n) or _norm_name(n) in nq]
     return nodes[: max(limit, 1)]
-

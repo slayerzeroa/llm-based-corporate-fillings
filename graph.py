@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
+SYSTEM_MAX_EDGES = 50
+
 
 def _norm_yyyymmdd(s: str) -> str:
     raw = str(s).replace("-", "").strip()
@@ -328,6 +330,9 @@ def _aggregate_edges(
     max_edges: int | None,
     pinned_node: str | None = None,
 ) -> pd.DataFrame:
+    if max_edges is not None:
+        max_edges = max(1, min(int(max_edges), SYSTEM_MAX_EDGES))
+
     edges = (
         df.groupby(["corp_name", "iscmp_cmpnm"], as_index=False)["amount_abs"]
         .sum()
@@ -473,6 +478,17 @@ def _related_nodes_undirected(G: nx.Graph, center: str, hops: int = 1) -> set[st
     return seen
 
 
+def _k_hop_nodes_from_edges(edges: pd.DataFrame, center: str | None, hops: int) -> set[str]:
+    if edges.empty or not center:
+        return set()
+    g = nx.Graph()
+    for _, r in edges.iterrows():
+        g.add_edge(str(r["src"]), str(r["dst"]))
+    # When searching, keep at least direct neighbors (hop=1) to avoid empty graph.
+    use_hops = max(int(hops), 1)
+    return _related_nodes_undirected(g, center, hops=use_hops)
+
+
 def _build_snapshot_traces(
     edges: pd.DataFrame,
     pos: dict,
@@ -509,7 +525,7 @@ def _build_snapshot_traces(
         return np.array([0.0, 0.0, 0.0])
 
     selected = highlight_node if (highlight_node in G) else None
-    related = _related_nodes_undirected(G_u, selected, hops=highlight_hops) if selected else set()
+    related = _related_nodes_undirected(G_u, selected, hops=max(highlight_hops, 1)) if selected else set()
 
     node_x, node_y, node_z = [], [], []
     node_size_raw, node_text = [], []
@@ -648,6 +664,16 @@ def _build_figure_for_filtered_df(
     all_nodes = sorted(set(full_edges["src"]).union(set(full_edges["dst"])))
     selected = _resolve_highlight_node(all_nodes, highlight_stock)
 
+    if selected:
+        keep_nodes = _k_hop_nodes_from_edges(full_edges, selected, highlight_hops)
+        if keep_nodes:
+            dsub = dsub[
+                dsub["corp_name"].isin(keep_nodes) & dsub["iscmp_cmpnm"].isin(keep_nodes)
+            ].copy()
+            full_edges = full_edges[
+                full_edges["src"].isin(keep_nodes) & full_edges["dst"].isin(keep_nodes)
+            ].copy()
+
     edges = _aggregate_edges(dsub, max_edges=max_edges, pinned_node=selected)
     if edges.empty:
         fig = go.Figure()
@@ -722,6 +748,16 @@ def build_stock_relationship_3d(
     selected_node = _resolve_highlight_node(all_nodes, highlight_stock)
     if highlight_stock and not selected_node:
         print(f"[WARN] highlight_stock '{highlight_stock}' not found. Highlight disabled.")
+
+    if selected_node:
+        keep_nodes = _k_hop_nodes_from_edges(all_edges, selected_node, highlight_hops)
+        if keep_nodes:
+            df = df[
+                df["corp_name"].isin(keep_nodes) & df["iscmp_cmpnm"].isin(keep_nodes)
+            ].copy()
+            all_edges = all_edges[
+                all_edges["src"].isin(keep_nodes) & all_edges["dst"].isin(keep_nodes)
+            ].copy()
 
     full_edges = _aggregate_edges(df, max_edges=max_edges, pinned_node=selected_node)
     if full_edges.empty:
@@ -981,7 +1017,7 @@ if __name__ == "__main__":
     parser.add_argument("--input-source", choices=["csv", "module", "db"], default="module")
     parser.add_argument("--csv-path", default="./sample_transfer_1y.csv")
     parser.add_argument("--out-html", default="./stock_relationship_3d.html")
-    parser.add_argument("--max-edges", type=int, default=80)
+    parser.add_argument("--max-edges", type=int, default=SYSTEM_MAX_EDGES)
     parser.add_argument("--only-last-1y", action="store_true")
     parser.add_argument("--start-date", default=None, help="YYYY-MM-DD or YYYYMMDD")
     parser.add_argument("--end-date", default=None, help="YYYY-MM-DD or YYYYMMDD")
@@ -1005,6 +1041,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+    args.max_edges = max(1, min(int(args.max_edges), SYSTEM_MAX_EDGES))
 
     reprt_codes = tuple(c.strip() for c in str(args.reprt_codes).split(",") if c.strip())
     fetch_start = args.fetch_start or args.start_date

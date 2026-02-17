@@ -11,11 +11,12 @@ function todayIso() {
 }
 
 export default function App() {
+  const SYSTEM_MAX_EDGES = 50;
   const [startDate, setStartDate] = useState("2015-01-01");
   const [endDate, setEndDate] = useState(todayIso());
   const [searchStock, setSearchStock] = useState("");
   const [highlightHops, setHighlightHops] = useState(1);
-  const [maxEdges, setMaxEdges] = useState(80);
+  const [maxEdges, setMaxEdges] = useState(SYSTEM_MAX_EDGES);
   const [dbLimit, setDbLimit] = useState("");
   const [snapshotDates, setSnapshotDates] = useState([]);
   const [snapshotIndex, setSnapshotIndex] = useState(0);
@@ -41,7 +42,7 @@ export default function App() {
         snapshot_date: opts.snapshotDate ?? snapshotDate,
         search_stock: searchStock || null,
         highlight_hops: highlightHops,
-        max_edges: maxEdges,
+        max_edges: Math.max(1, Math.min(Number(maxEdges || SYSTEM_MAX_EDGES), SYSTEM_MAX_EDGES)),
         db_limit: dbLimit ? Number(dbLimit) : null
       };
       const data = await postGraphQuery(payload);
@@ -118,9 +119,13 @@ export default function App() {
             <input
               type="number"
               min={1}
-              max={5000}
+              max={SYSTEM_MAX_EDGES}
               value={maxEdges}
-              onChange={(e) => setMaxEdges(Number(e.target.value || 80))}
+              onChange={(e) =>
+                setMaxEdges(
+                  Math.max(1, Math.min(Number(e.target.value || SYSTEM_MAX_EDGES), SYSTEM_MAX_EDGES))
+                )
+              }
             />
           </label>
           <label>
@@ -210,4 +215,3 @@ export default function App() {
     </div>
   );
 }
-
