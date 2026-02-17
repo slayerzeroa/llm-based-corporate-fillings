@@ -10,6 +10,101 @@ import pandas as pd
 import plotly.graph_objects as go
 
 
+def _norm_yyyymmdd(s: str) -> str:
+    raw = str(s).replace("-", "").strip()
+    if len(raw) != 8 or not raw.isdigit():
+        raise ValueError(f"Invalid date format: {s} (YYYYMMDD or YYYY-MM-DD)")
+    return raw
+
+
+def _prepare_graph_input_csv(
+    csv_path: str,
+    input_source: str,
+    *,
+    api_key: str | None,
+    investor: str | None,
+    corp_code: str | None,
+    fetch_start: str | None,
+    fetch_end: str | None,
+    reprt_codes: tuple[str, ...],
+    include_periodic_status: bool,
+    include_majorstock_status: bool,
+    include_transfer_note_plan: bool,
+    max_note_reports: int,
+) -> str:
+    if input_source == "csv":
+        return csv_path
+
+    from config import load_settings
+    from function import CorporateHoldingsModule
+
+    settings = load_settings()
+    use_api_key = (api_key or settings.dart_api_key or "").strip()
+    if not use_api_key:
+        raise RuntimeError(
+            "DART API key not found. Set OPENDART_API_KEY (or DART_API_KEY) "
+            "or pass --api-key."
+        )
+
+    if not fetch_start or not fetch_end:
+        raise ValueError(
+            "Module input requires --fetch-start and --fetch-end "
+            "(or --start-date/--end-date as fallback)."
+        )
+
+    start_ymd = _norm_yyyymmdd(fetch_start)
+    end_ymd = _norm_yyyymmdd(fetch_end)
+
+    module = CorporateHoldingsModule(api_key=use_api_key)
+
+    if investor:
+        resolved_code, resolved_name, resolved_stock, data = module.fetch_all_holding_dfs_by_investor(
+            investor=investor,
+            bgn_de=start_ymd,
+            end_de=end_ymd,
+            start_year=int(start_ymd[:4]),
+            end_year=int(end_ymd[:4]),
+            reprt_codes=reprt_codes,
+            include_periodic_status=include_periodic_status,
+            include_majorstock_status=include_majorstock_status,
+            include_transfer_note_plan=include_transfer_note_plan,
+            max_note_reports=max_note_reports,
+        )
+        print(
+            f"[INFO] module input by investor -> corp_code={resolved_code}, "
+            f"corp_name={resolved_name}, stock_code={resolved_stock}"
+        )
+    elif corp_code:
+        data = module.fetch_all_holding_dfs(
+            corp_code=str(corp_code).zfill(8),
+            bgn_de=start_ymd,
+            end_de=end_ymd,
+            start_year=int(start_ymd[:4]),
+            end_year=int(end_ymd[:4]),
+            reprt_codes=reprt_codes,
+            include_periodic_status=include_periodic_status,
+            include_majorstock_status=include_majorstock_status,
+            include_transfer_note_plan=include_transfer_note_plan,
+            max_note_reports=max_note_reports,
+        )
+        print(f"[INFO] module input by corp_code={str(corp_code).zfill(8)}")
+    else:
+        raise ValueError("Provide --investor or --corp-code when --input-source module is used.")
+
+    combined = data.get("combined", pd.DataFrame())
+    if combined.empty:
+        raise ValueError("Module returned an empty combined dataframe.")
+
+    out_csv = csv_path or "./data/holdings_graph_input.csv"
+    out_dir = os.path.dirname(out_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    combined.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"[INFO] module combined rows={len(combined):,} saved -> {out_csv}")
+
+    return out_csv
+
+
 def _read_transfer_csv_robust(csv_path: str) -> pd.DataFrame:
     """
     Load transfer CSV robustly.
@@ -112,6 +207,16 @@ def _prepare_network_dataframe(csv_path: str, only_last_1y: bool = False) -> pd.
     df["amount_abs"] = pd.to_numeric(df["trfdtl_trfprc"], errors="coerce").abs().fillna(0)
     df["corp_name"] = df["corp_name"].astype(str).str.strip()
     df["iscmp_cmpnm"] = df["iscmp_cmpnm"].astype(str).str.strip()
+
+    # Legacy CSV safety filters:
+    # - exclude periodic status snapshots
+    # - exclude majorstock proxy snapshots
+    # - exclude summary rows
+    if "source" in df.columns:
+        df = df[~df["source"].astype(str).str.contains("OTRCPR_INVSTMNT_STTUS", na=False)].copy()
+        df = df[~df["source"].astype(str).str.contains("MAJORSTOCK_STKQY_PROXY", na=False)].copy()
+    df = df[~df["iscmp_cmpnm"].astype(str).str.replace(r"\s+", "", regex=True).isin(["합계", "총계", "소계"])].copy()
+
     df = df[(df["corp_name"] != "") & (df["iscmp_cmpnm"] != "")]
     df = df[df["corp_name"] != df["iscmp_cmpnm"]].copy()
 
@@ -667,12 +772,23 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["dashboard", "static"], default="dashboard")
+    parser.add_argument("--input-source", choices=["csv", "module"], default="module")
     parser.add_argument("--csv-path", default="./sample_transfer_1y.csv")
     parser.add_argument("--out-html", default="./stock_relationship_3d.html")
     parser.add_argument("--max-edges", type=int, default=80)
     parser.add_argument("--only-last-1y", action="store_true")
     parser.add_argument("--start-date", default=None, help="YYYY-MM-DD or YYYYMMDD")
     parser.add_argument("--end-date", default=None, help="YYYY-MM-DD or YYYYMMDD")
+    parser.add_argument("--fetch-start", default=None, help="YYYY-MM-DD or YYYYMMDD (module fetch range)")
+    parser.add_argument("--fetch-end", default=None, help="YYYY-MM-DD or YYYYMMDD (module fetch range)")
+    parser.add_argument("--api-key", default=None, help="DART API key override for module input")
+    parser.add_argument("--investor", default=None, help="Investor name or code for module input")
+    parser.add_argument("--corp-code", default=None, help="8-digit corp_code for module input")
+    parser.add_argument("--reprt-codes", default="11011", help="Comma-separated reprt_code values")
+    parser.add_argument("--include-periodic-status", action="store_true", help="Include periodic status data (otrCprInvstmntSttus)")
+    parser.add_argument("--include-majorstock-status", action="store_true", help="Include majorstock status proxy data")
+    parser.add_argument("--exclude-note-plan", action="store_true", help="Disable note-plan extraction")
+    parser.add_argument("--max-note-reports", type=int, default=200)
     parser.add_argument("--snapshot-nav", action="store_true", help="Enable one-date snapshot slider navigation")
     parser.add_argument("--highlight-stock", default="SK")
     parser.add_argument("--highlight-hops", type=int, default=1)
@@ -681,9 +797,27 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
+    reprt_codes = tuple(c.strip() for c in str(args.reprt_codes).split(",") if c.strip())
+    fetch_start = args.fetch_start or args.start_date
+    fetch_end = args.fetch_end or args.end_date
+    input_csv = _prepare_graph_input_csv(
+        csv_path=args.csv_path,
+        input_source=args.input_source,
+        api_key=args.api_key,
+        investor=args.investor,
+        corp_code=args.corp_code,
+        fetch_start=fetch_start,
+        fetch_end=fetch_end,
+        reprt_codes=reprt_codes or ("11011",),
+        include_periodic_status=args.include_periodic_status,
+        include_majorstock_status=args.include_majorstock_status,
+        include_transfer_note_plan=not args.exclude_note_plan,
+        max_note_reports=args.max_note_reports,
+    )
+
     if args.mode == "dashboard":
         run_stock_relationship_dashboard(
-            csv_path=args.csv_path,
+            csv_path=input_csv,
             max_edges=args.max_edges,
             only_last_1y=args.only_last_1y,
             host=args.host,
@@ -692,7 +826,7 @@ if __name__ == "__main__":
         )
     else:
         fig, top_edges, saved_path = build_stock_relationship_3d(
-            csv_path=args.csv_path,
+            csv_path=input_csv,
             out_html=args.out_html,
             max_edges=args.max_edges,
             only_last_1y=args.only_last_1y,
