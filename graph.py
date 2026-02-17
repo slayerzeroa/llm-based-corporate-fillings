@@ -23,6 +23,7 @@ def _prepare_graph_input_csv(
     *,
     api_key: str | None,
     investor: str | None,
+    stock_code: str | None,
     corp_code: str | None,
     fetch_start: str | None,
     fetch_end: str | None,
@@ -57,9 +58,16 @@ def _prepare_graph_input_csv(
 
     module = CorporateHoldingsModule(api_key=use_api_key)
 
-    if investor:
+    if investor and stock_code:
+        raise ValueError("Use either --investor or --stock-code, not both.")
+
+    lookup_investor = investor
+    if stock_code:
+        lookup_investor = str(stock_code).strip().zfill(6)
+
+    if lookup_investor:
         resolved_code, resolved_name, resolved_stock, data = module.fetch_all_holding_dfs_by_investor(
-            investor=investor,
+            investor=lookup_investor,
             bgn_de=start_ymd,
             end_de=end_ymd,
             start_year=int(start_ymd[:4]),
@@ -71,7 +79,7 @@ def _prepare_graph_input_csv(
             max_note_reports=max_note_reports,
         )
         print(
-            f"[INFO] module input by investor -> corp_code={resolved_code}, "
+            f"[INFO] module input by investor/stock-code -> corp_code={resolved_code}, "
             f"corp_name={resolved_name}, stock_code={resolved_stock}"
         )
     elif corp_code:
@@ -89,7 +97,7 @@ def _prepare_graph_input_csv(
         )
         print(f"[INFO] module input by corp_code={str(corp_code).zfill(8)}")
     else:
-        raise ValueError("Provide --investor or --corp-code when --input-source module is used.")
+        raise ValueError("Provide --investor, --stock-code, or --corp-code when --input-source module is used.")
 
     combined = data.get("combined", pd.DataFrame())
     if combined.empty:
@@ -783,6 +791,7 @@ if __name__ == "__main__":
     parser.add_argument("--fetch-end", default=None, help="YYYY-MM-DD or YYYYMMDD (module fetch range)")
     parser.add_argument("--api-key", default=None, help="DART API key override for module input")
     parser.add_argument("--investor", default=None, help="Investor name or code for module input")
+    parser.add_argument("--stock-code", default=None, help="6-digit stock code for module input")
     parser.add_argument("--corp-code", default=None, help="8-digit corp_code for module input")
     parser.add_argument("--reprt-codes", default="11011", help="Comma-separated reprt_code values")
     parser.add_argument("--include-periodic-status", action="store_true", help="Include periodic status data (otrCprInvstmntSttus)")
@@ -805,6 +814,7 @@ if __name__ == "__main__":
         input_source=args.input_source,
         api_key=args.api_key,
         investor=args.investor,
+        stock_code=args.stock_code,
         corp_code=args.corp_code,
         fetch_start=fetch_start,
         fetch_end=fetch_end,

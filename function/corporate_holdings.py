@@ -27,7 +27,7 @@ BASE_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 DOCUMENT_URL = "https://opendart.fss.or.kr/api/document.xml"
 MAIN_URL = "https://dart.fss.or.kr/dsaf001/main.do"
 VIEWER_URL = "https://dart.fss.or.kr/report/viewer.do"
-TRANSFER_TITLE_REGEX = r"타법인\s*주식\s*및\s*출자증권\s*(?:처분결정|양도결정)"
+TRANSFER_TITLE_REGEX = r"타법인\s*주식\s*및\s*출자증권\s*(?:처분결정|양도결정|취득결정|양수결정)"
 
 VIEWDOC_PATTERN = re.compile(
     r"viewDoc\(\s*['\"](?P<rcpNo>\d{14})['\"]\s*,\s*['\"](?P<dcmNo>\d+)['\"]\s*,\s*['\"](?P<eleId>\d+)['\"]\s*,\s*['\"](?P<offset>\d+)['\"]\s*,\s*['\"](?P<length>\d+)['\"]\s*,\s*['\"](?P<dtd>[^'\"]+)['\"]\s*\)",
@@ -218,15 +218,23 @@ LEGACY_CORE_FIELDS = [
 ]
 
 LEGACY_LABEL_MAP = {
-    "iscmp_cmpnm": ["발행회사(회사명)", "발행회사 회사명", "발행회사"],
-    "trfdtl_stkcnt": ["양도내역(양도주식수(주))", "양도주식수", "양도 주식수"],
-    "trfdtl_trfprc": ["양도내역(양도금액(원)(A))", "양도금액", "양도 금액"],
+    "iscmp_cmpnm": ["발행회사(회사명)", "발행회사 회사명", "발행회사", "회사명"],
+    "trfdtl_stkcnt": [
+        "양도내역(양도주식수(주))", "양도주식수", "양도 주식수",
+        "취득내역(취득주식수(주))", "취득주식수", "취득 주식수",
+        "양수내역(양수주식수(주))", "양수주식수", "양수 주식수",
+    ],
+    "trfdtl_trfprc": [
+        "양도내역(양도금액(원)(A))", "양도금액", "양도 금액",
+        "취득내역(취득금액(원)(A))", "취득금액", "취득 금액",
+        "양수내역(양수금액(원)(A))", "양수금액", "양수 금액",
+    ],
     "trfdtl_tast": ["양도내역(총자산(원)(B))", "총자산(원)(B)", "총자산"],
     "trfdtl_ecpt": ["양도내역(자기자본(원)(C))", "자기자본(원)(C)", "자기자본"],
     "attrf_owstkcnt": ["양도후 소유주식수 및 지분비율(소유주식수(주))", "양도후 소유주식수", "소유주식수(주)"],
     "attrf_eqrt": ["양도후 소유주식수 및 지분비율(지분비율(%))", "양도후 지분비율", "지분비율(%)"],
-    "trf_pp": ["양도목적", "양도 목적"],
-    "trf_prd": ["양도예정일자", "양도 예정일자"],
+    "trf_pp": ["양도목적", "양도 목적", "취득목적", "취득 목적", "양수목적", "양수 목적"],
+    "trf_prd": ["양도예정일자", "양도 예정일자", "취득예정일자", "취득 예정일자", "양수예정일자", "양수 예정일자"],
     "dlptn_cmpnm": ["거래상대방(회사명(성명))", "거래상대방 회사명", "거래상대방", "상대방"],
     "bddd": ["이사회결의일(결정일)", "이사회결의일", "결정일"],
     "corp_name": ["공시대상회사명", "회사명"],
@@ -459,15 +467,24 @@ def _norm_label(s: str) -> str:
 
 
 _LABEL_TO_FIELD = {
+    "회사명": "iscmp_cmpnm",
     "회사명(국적)": "iscmp_cmpnm",
     "처분주식수(주)": "trfdtl_stkcnt",
+    "취득주식수(주)": "trfdtl_stkcnt",
+    "양수주식수(주)": "trfdtl_stkcnt",
     "처분금액(원)": "trfdtl_trfprc",
+    "취득금액(원)": "trfdtl_trfprc",
+    "양수금액(원)": "trfdtl_trfprc",
     "자기자본(원)": "trfdtl_ecpt",
     "자기자본대비(%)": "trfdtl_tast",
     "소유주식수(주)": "attrf_owstkcnt",
     "지분비율(%)": "attrf_eqrt",
     "처분목적": "trf_pp",
+    "취득목적": "trf_pp",
+    "양수목적": "trf_pp",
     "처분예정일자": "trf_prd",
+    "취득예정일자": "trf_prd",
+    "양수예정일자": "trf_prd",
     "이사회결의일(결정일)": "bddd",
 }
 _LABEL_TO_FIELD_N = {_norm_label(k): v for k, v in _LABEL_TO_FIELD.items()}
@@ -578,7 +595,7 @@ def _is_bad_issuer(x: Any) -> bool:
     if _is_empty_like(x):
         return True
     s = str(x).strip()
-    return s in {"회사명(국적)", "발행회사", "1. 발행회사"}
+    return s in {"회사명", "회사명(국적)", "발행회사", "1. 발행회사"}
 
 
 def _extract_submitter_from_title(viewer_html: str) -> Any:
@@ -603,22 +620,47 @@ def _extract_issuer_from_viewer_table(markup: str) -> Any:
         texts = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)).strip() for c in cells]
         for i, t in enumerate(texts[:-1]):
             key = re.sub(r"\s+", "", t)
-            if key == "회사명(국적)":
+            if key in {"회사명(국적)", "회사명"}:
                 v = texts[i + 1].strip()
                 if not _is_bad_issuer(v):
                     return v
 
     plain = soup.get_text("\n", strip=True)
-    m = re.search(
-        r"회사명\(국적\)\s*([^\n]{2,80}?)\s*(?:대표이사|자본금\(원\)|자본금)",
-        plain,
-        flags=re.I | re.S,
-    )
-    if m:
+    patterns = [
+        r"회사명\(국적\)\s*([^\n]{2,120}?)\s*(?:대표이사|자본금\(원\)|자본금)",
+        r"회사명\s*([^\n]{2,120}?)\s*(?:국적|대표자|대표이사|자본금\(원\)|자본금)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, plain, flags=re.I | re.S)
+        if not m:
+            continue
         v = re.sub(r"\s+", " ", m.group(1)).strip(" \t:-")
         if not _is_bad_issuer(v):
             return v
     return pd.NA
+
+
+def _extract_issuer_from_text(raw_text: str) -> Any:
+    if not raw_text:
+        return pd.NA
+    txt = re.sub(r"\s+", " ", str(raw_text))
+    patterns = [
+        r"회사명\(국적\)\s*([가-힣A-Za-z0-9\(\)\.\-·&\s]{2,120}?)\s*(?:대표이사|대표자|자본금\(원\)|자본금)",
+        r"회사명\s*([가-힣A-Za-z0-9\(\)\.\-·&㈜\s]{2,120}?)\s*(?:국적|대표자|대표이사|자본금\(원\)|자본금)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.I | re.S)
+        if not m:
+            continue
+        v = re.sub(r"\s+", " ", m.group(1)).strip(" \t:-")
+        if not _is_bad_issuer(v):
+            return v
+    return pd.NA
+
+
+def _is_acquire_report_name(report_nm: Any) -> bool:
+    s = str(report_nm or "")
+    return ("취득결정" in s) or ("양수결정" in s)
 
 
 def _parse_plan_items(note_text: str) -> List[Dict[str, Any]]:
@@ -1030,7 +1072,7 @@ def extract_transfer_decision_from_viewer_url(
     row["report_nm"] = "타법인주식및출자증권처분결정"
     row["source"] = "INIT"
 
-    for k in ("corp_cls", "corp_code", "corp_name", "flr_nm", "pblntf_ty"):
+    for k in ("corp_cls", "corp_code", "corp_name", "flr_nm", "pblntf_ty", "report_nm"):
         v = seed.get(k)
         if not _is_empty_like(v):
             row[k] = v
@@ -1136,17 +1178,18 @@ def extract_transfer_decision_from_viewer_url(
             if _is_bad_issuer(row.get("iscmp_cmpnm")):
                 issuer = _extract_issuer_from_viewer_table(viewer_html)
                 if _is_bad_issuer(issuer) and doc_raw_text:
-                    m = re.search(
-                        r"회사명\(국적\)\s*([가-힣A-Za-z0-9\(\)\.\-·&\s]{2,80}?)\s*(?:대표이사|자본금\(원\)|자본금)",
-                        re.sub(r"\s+", " ", doc_raw_text),
-                    )
-                    issuer = m.group(1).strip() if m else pd.NA
+                    issuer = _extract_issuer_from_text(doc_raw_text)
                 if not _is_bad_issuer(issuer):
                     row["iscmp_cmpnm"] = issuer
         except Exception as e:
             if verbose:
                 print(f"[WARN] document 구조화 파싱 실패: {e}")
             row["source"] = (str(row["source"]) + "+DOC_PARSE_FAIL").strip("+")
+
+    if _is_bad_issuer(row.get("iscmp_cmpnm")):
+        issuer = _extract_issuer_from_text(doc_raw_text)
+        if not _is_bad_issuer(issuer):
+            row["iscmp_cmpnm"] = issuer
 
     for c in LEGACY_NUM_COLS:
         if c in row:
@@ -1167,10 +1210,12 @@ def extract_transfer_decision_from_viewer_url(
 
     rows: List[Dict[str, Any]] = []
     base = row.copy()
+    is_acquire = _is_acquire_report_name(base.get("report_nm"))
+    signed = 1 if is_acquire else -1
     if "trfdtl_stkcnt" in base:
-        base["trfdtl_stkcnt"] = _signed_num(base.get("trfdtl_stkcnt"), sign=-1)
+        base["trfdtl_stkcnt"] = _signed_num(base.get("trfdtl_stkcnt"), sign=signed)
     if "trfdtl_trfprc" in base:
-        base["trfdtl_trfprc"] = _signed_num(base.get("trfdtl_trfprc"), sign=-1)
+        base["trfdtl_trfprc"] = _signed_num(base.get("trfdtl_trfprc"), sign=signed)
     rows.append(base)
 
     for it in items:
