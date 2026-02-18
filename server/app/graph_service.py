@@ -81,6 +81,7 @@ def _build_base_where(
     start_date: str | None,
     end_date: str | None,
     snapshot_date: str | None,
+    corp_name_filter: str | None,
     include_periodic_status: bool,
     include_majorstock_status: bool,
 ) -> tuple[str, list[object]]:
@@ -104,6 +105,9 @@ def _build_base_where(
     if snapshot_date:
         conditions.append("rcept_dt <= %s")
         params.append(_to_date_str(snapshot_date))
+    if corp_name_filter:
+        conditions.append("corp_name = %s")
+        params.append(str(corp_name_filter).strip())
 
     if not include_periodic_status:
         conditions.append("(source IS NULL OR source NOT LIKE %s)")
@@ -116,10 +120,12 @@ def _build_base_where(
 
 
 def _query_snapshot_dates(query: GraphQuery, settings: ServerSettings) -> list[str]:
+    corp_name_filter = str(query.search_stock).strip() if query.search_stock else None
     where_sql, params = _build_base_where(
         start_date=query.start_date,
         end_date=query.end_date,
         snapshot_date=None,
+        corp_name_filter=corp_name_filter,
         include_periodic_status=query.include_periodic_status,
         include_majorstock_status=query.include_majorstock_status,
     )
@@ -152,10 +158,12 @@ def _build_base_event_subquery(
     *,
     snapshot_date: str,
 ) -> tuple[str, list[object]]:
+    corp_name_filter = str(query.search_stock).strip() if query.search_stock else None
     where_sql, params = _build_base_where(
         start_date=query.start_date,
         end_date=query.end_date,
         snapshot_date=snapshot_date,
+        corp_name_filter=corp_name_filter,
         include_periodic_status=query.include_periodic_status,
         include_majorstock_status=query.include_majorstock_status,
     )
@@ -486,6 +494,8 @@ def _build_figure_json(
 
 
 def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphResponse:
+    selected_corp = str(query.search_stock).strip() if query.search_stock else None
+
     effective_max_edges = max(1, min(int(query.max_edges), SYSTEM_MAX_EDGES))
     cache_key = (
         settings.db_table,
@@ -507,13 +517,16 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
     if not snapshot_dates:
         empty_fig = go.Figure()
         empty_fig.update_layout(title="No data in selected range", height=850)
+        status_text = "No data in selected range."
+        if selected_corp:
+            status_text = f"'{selected_corp}' 종목 데이터가 선택된 기간에 없습니다."
         response = GraphResponse(
             snapshot_dates=[],
             snapshot_date=None,
-            selected_stock=None,
+            selected_stock=selected_corp,
             rows=0,
             edges_shown=0,
-            status_text="No data in selected range.",
+            status_text=status_text,
             figure=json.loads(empty_fig.to_json()),
             top_edges=[],
         )
@@ -553,10 +566,10 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
         return response
 
     all_nodes = sorted(set(all_edges["src"]).union(set(all_edges["dst"])))
-    selected = _resolve_highlight_node(all_nodes, query.search_stock)
+    selected = selected_corp if selected_corp else _resolve_highlight_node(all_nodes, query.search_stock)
     keep_nodes: set[str] | None = None
 
-    if selected:
+    if selected and not selected_corp:
         keep_nodes = _k_hop_nodes_from_edges(all_edges, selected, query.highlight_hops)
         if keep_nodes:
             all_edges = all_edges[
@@ -641,25 +654,36 @@ def list_stock_options(
         start_date=start_date,
         end_date=end_date,
         snapshot_date=None,
+        corp_name_filter=None,
         include_periodic_status=include_periodic_status,
         include_majorstock_status=include_majorstock_status,
     )
 
+    extra = ""
+    if q and q.strip():
+        extra = " AND corp_name LIKE %s"
+        params.append(f"%{q.strip()}%")
+
+    sql = f"""
+    SELECT DISTINCT TRIM(corp_name) AS name
+    FROM {settings.db_table}
+    WHERE {where_sql} {extra}
+      AND corp_name IS NOT NULL
+      AND TRIM(corp_name) <> ''
+      AND TRIM(corp_name) <> '-'
+      AND TRIM(corp_name) <> 'nan'
+      AND TRIM(corp_name) <> 'None'
+    """
+
     sql = f"""
     SELECT name FROM (
-        SELECT TRIM(corp_name) AS name
-        FROM {settings.db_table}
-        WHERE {where_sql}
-        UNION DISTINCT
-        SELECT TRIM(iscmp_cmpnm) AS name
-        FROM {settings.db_table}
-        WHERE {where_sql}
+    {sql}
     ) u
     WHERE name IS NOT NULL AND name <> ''
     ORDER BY name ASC
     LIMIT %s
     """
-    query_params = list(params) + list(params) + [max(int(limit) * 4, int(limit), 1)]
+    query_params = list(params) + [max(int(limit) * 4, int(limit), 1)]
 
     conn = get_connection()
     try:

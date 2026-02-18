@@ -7,6 +7,13 @@ from functools import lru_cache
 
 from dotenv import load_dotenv
 
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "https://slayerzeroa.github.io",
+]
+
 
 @dataclass(frozen=True)
 class ServerSettings:
@@ -37,9 +44,12 @@ def _parse_port(raw: str | None) -> int:
 
 def _parse_cors(raw: str | None) -> list[str]:
     if not raw:
-        return ["http://localhost:5173", "http://127.0.0.1:5173"]
+        return DEFAULT_CORS_ORIGINS.copy()
     items = [x.strip() for x in raw.split(",") if x.strip()]
-    return items or ["*"]
+    if not items:
+        return ["*"]
+    merged = list(dict.fromkeys(items + DEFAULT_CORS_ORIGINS))
+    return merged
 
 
 @lru_cache(maxsize=1)
@@ -76,4 +86,3 @@ def get_settings() -> ServerSettings:
         db_table=db_table,
         cors_origins=cors_origins,
     )
-

@@ -93,7 +93,7 @@ export default function App() {
   }, [searchStock, startDate, endDate]);
 
   const onRefresh = async () => {
-    await loadGraph();
+    await loadGraph({ snapshotDate: null });
   };
 
   const onRangeReload = async () => {

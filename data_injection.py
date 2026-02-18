@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -268,15 +269,17 @@ def _upsert_rows(conn: pymysql.connections.Connection, rows: list[tuple[Any, ...
 
 def _build_target_frame(
     dart_api_key: str,
+    market: str,
     krx_date: Optional[str],
     timeout: int,
     max_retries: int,
     base_sleep: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     krx = KrxApiClient()
-    kospi = krx.get_current_kospi_tickers(as_of=krx_date)
-    if kospi.empty:
-        raise RuntimeError("No KOSPI tickers fetched from KRX.")
+    market_name = str(market).strip().upper()
+    market_df = krx.get_current_market_tickers(market=market_name, as_of=krx_date)
+    if market_df.empty:
+        raise RuntimeError(f"No {market_name} tickers fetched from KRX.")
 
     dart = OpenDartClient(
         api_key=dart_api_key,
@@ -288,7 +291,7 @@ def _build_target_frame(
     corp_df = corp_df[["stock_code", "corp_code", "corp_name"]].drop_duplicates(subset=["stock_code"]).copy()
     corp_df = corp_df.rename(columns={"corp_name": "dart_corp_name"})
 
-    merged = kospi.merge(corp_df, on="stock_code", how="left")
+    merged = market_df.merge(corp_df, on="stock_code", how="left")
     matched = merged[merged["corp_code"].notna()].copy()
     unmatched = merged[merged["corp_code"].isna()].copy()
 
@@ -300,8 +303,9 @@ def _build_target_frame(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch investment events for all current KOSPI stocks and upsert into dart_investment_events.",
+        description="Fetch investment events for current KRX market stocks and upsert into dart_investment_events.",
     )
+    parser.add_argument("--market", choices=["KOSPI", "KOSDAQ", "KONEX"], default="KOSDAQ")
     parser.add_argument("--start-date", default="20150101", help="YYYYMMDD or YYYY-MM-DD")
     parser.add_argument("--end-date", default=_today_yyyymmdd(), help="YYYYMMDD or YYYY-MM-DD")
     parser.add_argument("--krx-date", default=None, help="KRX base date (YYYYMMDD). Omit for latest available.")
@@ -313,11 +317,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-note-reports", type=int, default=200)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--sleep-sec", type=float, default=0.03)
+    parser.add_argument(
+        "--sleep-base-sec",
+        type=float,
+        default=20.0,
+        help="Per-stock base sleep seconds (default: 20).",
+    )
+    parser.add_argument(
+        "--sleep-jitter-min",
+        type=int,
+        default=1,
+        help="Per-stock random jitter min seconds (default: 1).",
+    )
+    parser.add_argument(
+        "--sleep-jitter-max",
+        type=int,
+        default=10,
+        help="Per-stock random jitter max seconds (default: 10).",
+    )
+    parser.add_argument(
+        "--sleep-sec",
+        type=float,
+        default=None,
+        help="Deprecated fixed sleep override. If set, random sleep is disabled.",
+    )
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--base-sleep", type=float, default=0.8)
-    parser.add_argument("--unmatched-out", default="unmatched_kospi_to_dart.csv")
+    parser.add_argument("--unmatched-out", default=None)
     parser.add_argument("--dry-run", action="store_true", help="Fetch and transform only, skip DB insert.")
     return parser.parse_args()
 
@@ -325,6 +352,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     load_dotenv()
+    market_name = str(args.market).strip().upper()
 
     settings = load_settings()
     dart_api_key = (args.dart_api_key or settings.dart_api_key or "").strip()
@@ -340,14 +368,16 @@ def main() -> None:
 
     targets, unmatched = _build_target_frame(
         dart_api_key=dart_api_key,
+        market=market_name,
         krx_date=args.krx_date,
         timeout=args.timeout,
         max_retries=args.max_retries,
         base_sleep=args.base_sleep,
     )
 
-    if args.unmatched_out and not unmatched.empty:
-        unmatched.to_csv(args.unmatched_out, index=False, encoding="utf-8-sig")
+    unmatched_out = args.unmatched_out or f"unmatched_{market_name.lower()}_to_dart.csv"
+    if unmatched_out and not unmatched.empty:
+        unmatched.to_csv(unmatched_out, index=False, encoding="utf-8-sig")
 
     total_targets = len(targets)
     if args.offset > 0:
@@ -360,7 +390,7 @@ def main() -> None:
         raise RuntimeError("No target KOSPI symbols to process after offset/limit.")
 
     print(
-        f"[MAP] kospi_total={total_targets:,}, mapped={total_targets - len(unmatched):,}, "
+        f"[MAP] market={market_name}, total={total_targets:,}, mapped={total_targets - len(unmatched):,}, "
         f"unmatched={len(unmatched):,}, run_targets={len(targets):,}"
     )
 
@@ -432,8 +462,18 @@ def main() -> None:
                 print(f"  -> ERROR: {exc}")
 
             processed += 1
-            if args.sleep_sec > 0:
-                time.sleep(args.sleep_sec)
+            if idx < len(targets) - 1:
+                if args.sleep_sec is not None:
+                    wait_sec = max(float(args.sleep_sec), 0.0)
+                else:
+                    base_sec = max(float(args.sleep_base_sec), 0.0)
+                    jitter_min = max(int(args.sleep_jitter_min), 0)
+                    jitter_max = max(int(args.sleep_jitter_max), jitter_min)
+                    wait_sec = base_sec + random.randint(jitter_min, jitter_max)
+
+                if wait_sec > 0:
+                    print(f"  -> sleep {wait_sec:.1f}s before next symbol")
+                    time.sleep(wait_sec)
     finally:
         if conn is not None:
             conn.close()

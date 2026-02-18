@@ -21,6 +21,13 @@ def _norm_yyyymmdd(value: str) -> str:
     return raw
 
 
+def _normalize_market(market: str) -> str:
+    m = str(market or "").strip().upper()
+    if m not in {"KOSPI", "KOSDAQ", "KONEX"}:
+        raise ValueError(f"Unsupported market: {market}. Use KOSPI, KOSDAQ, or KONEX.")
+    return m
+
+
 @dataclass
 class KrxApiClient:
     lookback_days: int = 14
@@ -33,16 +40,17 @@ class KrxApiClient:
             base = datetime.now()
         return [(base - timedelta(days=i)).strftime("%Y%m%d") for i in range(self.lookback_days + 1)]
 
-    def _fetch_kospi_from_pykrx(self, as_of: Optional[str] = None) -> pd.DataFrame:
+    def _fetch_market_from_pykrx(self, market: str, as_of: Optional[str] = None) -> pd.DataFrame:
         if stock is None:
             return pd.DataFrame(columns=["stock_code", "stock_name", "market", "as_of_date"])
 
+        use_market = _normalize_market(market)
         tickers: list[str] = []
         used_date: Optional[str] = None
 
         for ymd in self._candidate_dates(as_of):
             try:
-                one = stock.get_market_ticker_list(date=ymd, market="KOSPI")
+                one = stock.get_market_ticker_list(date=ymd, market=use_market)
             except Exception:
                 one = []
             if one:
@@ -63,14 +71,21 @@ class KrxApiClient:
                 {
                     "stock_code": ticker,
                     "stock_name": name if name else pd.NA,
-                    "market": "KOSPI",
+                    "market": use_market,
                     "as_of_date": f"{used_date[:4]}-{used_date[4:6]}-{used_date[6:8]}",
                 }
             )
 
         return pd.DataFrame(rows, columns=["stock_code", "stock_name", "market", "as_of_date"])
 
-    def _fetch_kospi_from_kind(self) -> pd.DataFrame:
+    def _fetch_market_from_kind(self, market: str) -> pd.DataFrame:
+        use_market = _normalize_market(market)
+        market_tokens = {
+            "KOSPI": {"유가", "KOSPI", "코스피"},
+            "KOSDAQ": {"코스닥", "KOSDAQ"},
+            "KONEX": {"코넥스", "KONEX"},
+        }
+
         resp = requests.get(
             self.kind_corp_list_url,
             timeout=30,
@@ -108,16 +123,23 @@ class KrxApiClient:
         out["stock_code"] = raw[stock_col].astype("string").str.replace(r"[^\d]", "", regex=True).str.zfill(6)
         out = out[out["stock_code"].str.match(r"^\d{6}$", na=False)].copy()
 
-        out = out[out["market_raw"].isin(["유가", "KOSPI", "코스피"])].copy()
-        out["market"] = "KOSPI"
+        out = out[out["market_raw"].isin(market_tokens[use_market])].copy()
+        out["market"] = use_market
         out["as_of_date"] = datetime.now().strftime("%Y-%m-%d")
 
         out = out[["stock_code", "stock_name", "market", "as_of_date"]].drop_duplicates(subset=["stock_code"])
         out = out.sort_values("stock_code").reset_index(drop=True)
         return out
 
-    def get_current_kospi_tickers(self, as_of: Optional[str] = None) -> pd.DataFrame:
-        pykrx_df = self._fetch_kospi_from_pykrx(as_of=as_of)
+    def get_current_market_tickers(self, market: str, as_of: Optional[str] = None) -> pd.DataFrame:
+        use_market = _normalize_market(market)
+        pykrx_df = self._fetch_market_from_pykrx(market=use_market, as_of=as_of)
         if not pykrx_df.empty:
             return pykrx_df
-        return self._fetch_kospi_from_kind()
+        return self._fetch_market_from_kind(market=use_market)
+
+    def get_current_kospi_tickers(self, as_of: Optional[str] = None) -> pd.DataFrame:
+        return self.get_current_market_tickers(market="KOSPI", as_of=as_of)
+
+    def get_current_kosdaq_tickers(self, as_of: Optional[str] = None) -> pd.DataFrame:
+        return self.get_current_market_tickers(market="KOSDAQ", as_of=as_of)
