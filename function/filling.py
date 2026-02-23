@@ -16,6 +16,7 @@ import re
 import time
 import html
 import zipfile
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Iterable
@@ -343,14 +344,117 @@ class OpenDartClient:
 
     # ---------- corp codes ----------
     def get_corp_codes(self, listed_only: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        cache_path = Path("data/cache/dart_corp_codes.csv")
+
+        def _normalize_corp_df(df: pd.DataFrame, listed: bool) -> pd.DataFrame:
+            out = df.copy()
+            for col in ("corp_code", "corp_name", "stock_code", "modify_date"):
+                if col not in out.columns:
+                    out[col] = ""
+            out["corp_code"] = out["corp_code"].astype(str).str.zfill(8)
+            out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
+            if listed:
+                out = out[out["stock_code"].str.match(r"^\d{6}$", na=False)].copy()
+            return out.reset_index(drop=True)
+
+        def _load_cached_corp_df(listed: bool) -> Optional[pd.DataFrame]:
+            if not cache_path.exists():
+                return None
+            try:
+                cached = pd.read_csv(cache_path, dtype=str).fillna("")
+            except Exception:
+                return None
+            if cached.empty:
+                return None
+            return _normalize_corp_df(cached, listed)
+
         if self._corp_cache is not None and not force_refresh:
             return self._corp_cache.copy()
 
-        r = self.session.get(BASE_CORPCODE_URL, params={"crtfc_key": self.api_key}, timeout=self.timeout)
-        r.raise_for_status()
+        if not force_refresh:
+            cached_df = _load_cached_corp_df(listed_only)
+            if cached_df is not None and not cached_df.empty:
+                self._corp_cache = cached_df
+                return cached_df.copy()
 
-        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-            xml_bytes = zf.read(zf.namelist()[0])
+        xml_bytes: Optional[bytes] = None
+        last_error: Optional[str] = None
+        payload = {"crtfc_key": self.api_key}
+
+        for attempt in range(self.max_retries):
+            try:
+                r = self.session.get(BASE_CORPCODE_URL, params=payload, timeout=self.timeout)
+                r.raise_for_status()
+                content = r.content or b""
+            except requests.RequestException as exc:
+                last_error = f"http_error={exc}"
+                time.sleep(self.base_sleep * (2 ** attempt))
+                continue
+
+            if not content:
+                last_error = "empty_response"
+                time.sleep(self.base_sleep * (2 ** attempt))
+                continue
+
+            # 정상 corpCode.xml은 zip(PK) 바이너리.
+            if content[:2] == b"PK":
+                try:
+                    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                        names = zf.namelist()
+                        if not names:
+                            last_error = "zip_no_entries"
+                            time.sleep(self.base_sleep * (2 ** attempt))
+                            continue
+                        xml_bytes = zf.read(names[0])
+                    break
+                except zipfile.BadZipFile:
+                    last_error = "bad_zip_payload"
+                    time.sleep(self.base_sleep * (2 ** attempt))
+                    continue
+
+            # 비-zip 응답은 JSON/XML 에러 payload 가능성이 높다.
+            text = content.decode("utf-8", errors="ignore").strip()
+            status = ""
+            message = ""
+            try:
+                js = r.json()
+                status = str(js.get("status", "")).strip()
+                message = str(js.get("message", "")).strip()
+            except Exception:
+                m_status = re.search(r"<status>\s*([^<]+)\s*</status>", text, flags=re.IGNORECASE)
+                m_message = re.search(r"<message>\s*([^<]+)\s*</message>", text, flags=re.IGNORECASE)
+                if m_status:
+                    status = m_status.group(1).strip()
+                if m_message:
+                    message = m_message.group(1).strip()
+
+            if status == "020":
+                last_error = f"status=020,message={message or 'call_limit'}"
+                time.sleep(self.base_sleep * (2 ** attempt))
+                continue
+
+            if status:
+                raise RuntimeError(
+                    f"DART corpCode API error: status={status}, message={message or 'unknown'}"
+                )
+
+            preview = text[:200].replace("\n", " ").replace("\r", " ")
+            last_error = f"non_zip_payload_preview={preview}"
+            time.sleep(self.base_sleep * (2 ** attempt))
+
+        if xml_bytes is None:
+            cached_df = _load_cached_corp_df(listed_only)
+            if cached_df is not None and not cached_df.empty:
+                self._corp_cache = cached_df
+                print(
+                    "[WARN] corpCode.xml fetch failed; using cached corp codes "
+                    f"from {cache_path} (last_error={last_error})"
+                )
+                return cached_df.copy()
+            raise RuntimeError(
+                "Failed to fetch corp codes (corpCode.xml) after retries. "
+                f"last_error={last_error}"
+            )
 
         root = ET.fromstring(xml_bytes)
         rows = []
@@ -369,13 +473,15 @@ class OpenDartClient:
             self._corp_cache = df
             return df
 
-        df["corp_code"] = df["corp_code"].astype(str).str.zfill(8)
-        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df = _normalize_corp_df(df, listed=False)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
 
-        if listed_only:
-            df = df[df["stock_code"].str.match(r"^\d{6}$", na=False)].copy()
-
-        self._corp_cache = df.reset_index(drop=True)
+        out_df = _normalize_corp_df(df, listed=listed_only)
+        self._corp_cache = out_df
         return self._corp_cache.copy()
 
     def resolve_investor(self, investor: str) -> tuple[str, str, str]:

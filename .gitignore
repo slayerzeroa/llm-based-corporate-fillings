@@ -3,3 +3,5 @@
 *.pyc
 *.csv
 *.xml
+logs
+dart_documents

@@ -92,7 +92,13 @@ def _build_base_where(
         "TRIM(corp_name) <> ''",
         "TRIM(iscmp_cmpnm) <> ''",
         "corp_name <> iscmp_cmpnm",
-        "REPLACE(TRIM(iscmp_cmpnm), ' ', '') NOT IN ('합계','총계','소계')",
+        (
+            "REPLACE(TRIM(iscmp_cmpnm), ' ', '') NOT IN ("
+            "'합계','총계','소계',"
+            "'회사명','회사명(국적)','발행회사','대표자','대표이사','국적','성명',"
+            "'(회사명)','(회사명(국적))','(발행회사)','(대표자)','(대표이사)','(국적)','(성명)'"
+            ")"
+        ),
     ]
     params: list[object] = []
 
@@ -173,6 +179,9 @@ def _build_base_event_subquery(
             corp_name,
             iscmp_cmpnm,
             trfdtl_trfprc,
+            trfdtl_stkcnt,
+            report_nm,
+            trf_pp,
             rcept_dt,
             rcept_no
         FROM {settings.db_table}
@@ -187,6 +196,9 @@ def _build_base_event_subquery(
         corp_name,
         iscmp_cmpnm,
         trfdtl_trfprc,
+        trfdtl_stkcnt,
+        report_nm,
+        trf_pp,
         rcept_dt,
         rcept_no
     FROM {settings.db_table}
@@ -216,16 +228,47 @@ def _query_aggregated_edges(
     SELECT
         src,
         dst,
-        SUM(weight_abs) AS weight
+        SUM(weight_signed) AS net_weight,
+        ABS(SUM(weight_signed)) AS weight
     FROM (
         SELECT
             corp_name AS src,
             iscmp_cmpnm AS dst,
-            ABS(COALESCE(CAST(trfdtl_trfprc AS DECIMAL(24, 6)), 0)) AS weight_abs
+            (
+                -- magnitude from amount, fallback to stock-count when amount is missing
+                ABS(
+                    COALESCE(
+                        CAST(trfdtl_trfprc AS DECIMAL(30, 6)),
+                        CAST(trfdtl_stkcnt AS DECIMAL(30, 6)),
+                        0
+                    )
+                )
+                *
+                -- base direction: explicit sign first, otherwise infer from report name
+                CASE
+                    WHEN COALESCE(CAST(trfdtl_trfprc AS DECIMAL(30, 6)), CAST(trfdtl_stkcnt AS DECIMAL(30, 6)), 0) < 0 THEN -1
+                    WHEN COALESCE(CAST(trfdtl_trfprc AS DECIMAL(30, 6)), CAST(trfdtl_stkcnt AS DECIMAL(30, 6)), 0) > 0 THEN 1
+                    WHEN report_nm LIKE '%%처분%%' OR report_nm LIKE '%%양도%%' THEN -1
+                    ELSE 1
+                END
+                *
+                -- cancellation/withdrawal/cancelled-correction are treated as reversing events
+                CASE
+                    WHEN report_nm LIKE '%%취소%%'
+                      OR report_nm LIKE '%%철회%%'
+                      OR report_nm LIKE '%%중단%%'
+                      OR trf_pp LIKE '%%취소%%'
+                      OR trf_pp LIKE '%%철회%%'
+                      OR trf_pp LIKE '%%중단%%'
+                    THEN -1
+                    ELSE 1
+                END
+            ) AS weight_signed
         FROM ({sub_sql}) base
     ) e
     {where_extra}
     GROUP BY src, dst
+    HAVING ABS(SUM(weight_signed)) > 0
     """
 
     conn = get_connection()
@@ -238,10 +281,12 @@ def _query_aggregated_edges(
 
     edges = pd.DataFrame(rows)
     if edges.empty:
-        return pd.DataFrame(columns=["src", "dst", "weight"])
+        return pd.DataFrame(columns=["src", "dst", "weight", "net_weight"])
     edges["src"] = edges["src"].astype(str)
     edges["dst"] = edges["dst"].astype(str)
     edges["weight"] = pd.to_numeric(edges["weight"], errors="coerce").fillna(0.0)
+    if "net_weight" in edges.columns:
+        edges["net_weight"] = pd.to_numeric(edges["net_weight"], errors="coerce").fillna(0.0)
     return edges
 
 
@@ -584,7 +629,7 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
         node_filter=keep_nodes if selected else None,
     )
     reporting_set = set(edges["src"].astype(str).unique()) if not edges.empty else set()
-    title = f"Stock Relationship 3D Network | As-Of Snapshot Date: {snapshot_date}"
+    title = f"Stock Relationship 3D Network (Net-Adjusted) | As-Of Snapshot Date: {snapshot_date}"
     if selected:
         title += f" | Highlight: {selected} (hop <= {query.highlight_hops})"
 
@@ -599,12 +644,14 @@ def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphRe
     if query.search_stock and not selected:
         status = (
             f"As-Of Snapshot Date: {snapshot_date} | Rows: {rows_count:,} | "
-            f"Edges shown: {len(edges):,} | stock search '{query.search_stock}' not found"
+            f"Edges shown: {len(edges):,} | net-adjusted (dispose/cancel reflected) | "
+            f"stock search '{query.search_stock}' not found"
         )
     else:
         status = (
             f"As-Of Snapshot Date: {snapshot_date} | Rows: {rows_count:,} | "
-            f"Edges shown: {len(edges):,}" + (f" | Highlight: {selected}" if selected else "")
+            f"Edges shown: {len(edges):,} | net-adjusted (dispose/cancel reflected)"
+            + (f" | Highlight: {selected}" if selected else "")
         )
 
     top = edges.sort_values("weight", ascending=False).head(20).copy()
