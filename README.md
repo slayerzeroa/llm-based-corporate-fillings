@@ -9,3 +9,26 @@
 5. 그래서 공시 자료를 어떻게 정리하고 싶은데?
    5.1. 세 가지 계층으로 정리
    5.2. raw 데이터, 정규화 데이터, 분석 데이터
+
+---
+
+## Server / Client 분리 실행
+
+### 1) 서버 실행 (`server/`)
+```bash
+pip install -r server/requirements.txt
+python server/run.py
+```
+
+- API: `http://127.0.0.1:5623`
+- 사용 env: `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_TABLE`
+
+### 2) 프론트 실행 (`client/`)
+```bash
+cd client
+npm install
+npm run dev
+```
+
+- UI: `http://127.0.0.1:5173`
+- Vite proxy로 `/api`는 서버(`:5623`)로 전달됨
