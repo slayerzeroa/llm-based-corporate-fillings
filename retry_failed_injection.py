@@ -267,14 +267,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-periodic-status", action="store_true")
     parser.add_argument("--include-majorstock-status", action="store_true")
     parser.add_argument("--exclude-note-plan", action="store_true")
-    parser.add_argument("--max-note-reports", type=int, default=200)
+    parser.add_argument("--max-note-reports", type=int, default=0, help="0 means no limit (all list B/I reports).")
     parser.add_argument("--base-offset", type=int, default=0, help="Original run offset if used.")
     parser.add_argument("--base-limit", type=int, default=None, help="Original run limit if used.")
     parser.add_argument(
         "--sleep-base-sec",
         type=float,
-        default=20.0,
-        help="Per-stock base sleep seconds (default: 20).",
+        default=10.0,
+        help="Per-stock base sleep seconds (default: 10).",
     )
     parser.add_argument(
         "--sleep-jitter-min",
@@ -297,6 +297,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--base-sleep", type=float, default=0.8)
+    parser.add_argument(
+        "--query-sleep-sec",
+        type=float,
+        default=0.5,
+        help="Sleep interval between each DART query request (default: 0.5).",
+    )
     parser.add_argument(
         "--allow-single-fallback",
         action="store_true",
@@ -360,6 +366,7 @@ def main() -> None:
                 timeout=args.timeout,
                 max_retries=args.max_retries,
                 base_sleep=args.base_sleep,
+                request_sleep_sec=args.query_sleep_sec,
             )
             total_targets = len(targets)
             cache_path = _save_target_cache(targets=targets, market_name=market_name)
@@ -470,12 +477,14 @@ def main() -> None:
         f"mapped={total_targets - len(unmatched):,}, unmatched={len(unmatched):,}, "
         f"base_targets={len(targets):,}, retry_targets={len(retry_targets):,}"
     )
+    logger.info("[QUERY] request_sleep_sec=%.3f", max(float(args.query_sleep_sec), 0.0))
 
     holdings = CorporateHoldingsModule(
         api_key=dart_api_key,
         timeout=args.timeout,
         max_retries=args.max_retries,
         base_sleep=args.base_sleep,
+        request_interval_sec=args.query_sleep_sec,
     )
 
     conn: Optional[pymysql.connections.Connection] = None
@@ -517,7 +526,7 @@ def main() -> None:
                     include_periodic_status=args.include_periodic_status,
                     include_majorstock_status=args.include_majorstock_status,
                     include_transfer_note_plan=not args.exclude_note_plan,
-                    max_note_reports=args.max_note_reports,
+                    max_note_reports=(None if int(args.max_note_reports) <= 0 else int(args.max_note_reports)),
                 )
                 combined = dfs.get("combined", pd.DataFrame())
                 rows = _prepare_db_rows(combined)

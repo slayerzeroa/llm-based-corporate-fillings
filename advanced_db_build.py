@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pandas as pd
 import pymysql
@@ -35,7 +35,7 @@ RCP_VALUE_RE = re.compile(r"rcpNo=(\d{14})", flags=re.IGNORECASE)
 
 DATE_ANY_RE = re.compile(r"(20\d{2})[^\d]([01]?\d)[^\d]([0-3]?\d)")
 TARGET_PLACEHOLDER_RE = re.compile(
-    r"^(합계|총계|소계|회사명(?:\(국적\))?|발행회사|대표자|대표이사|국적|성명|회사와관계|\(회사명\)|\(대표자\)|\(국적\))$"
+    r"^(합계|총계|소계|회사명(?:\(국적\))?|기업명|법인명|발행회사|대표자|대표이사|국적|성명|회사와관계|\(회사명\)|\(기업명\)|\(대표자\)|\(국적\))$"
 )
 CANCEL_KEYWORDS = [
     "철회",
@@ -110,6 +110,13 @@ def _safe_table_name(name: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_]+", name):
         raise ValueError(f"Invalid table name: {name}")
     return name
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _build_table_names(suffix: str) -> TableNames:
@@ -533,7 +540,9 @@ def _prepare_disclosures(source_df: pd.DataFrame, evidence_df: pd.DataFrame) -> 
         ("has_correction_text", 0),
         ("has_cancel_text", 0),
     ]:
-        out[c] = out[c].fillna(default).astype(int)
+        col = out[c]
+        col = col.where(~col.isna(), default)
+        out[c] = pd.to_numeric(col, errors="coerce").fillna(default).astype(int)
 
     out["cancel_reason_hint"] = out["cancel_reason_hint"].fillna("")
     out["raw_evidence_json"] = out["raw_evidence_json"].fillna("{}")
@@ -575,10 +584,20 @@ def _prepare_disclosures(source_df: pd.DataFrame, evidence_df: pd.DataFrame) -> 
         for idx in g.index.tolist():
             anchor = _norm_rcept_no(out.at[idx, "family_anchor_rcept_no"])
             if not anchor:
-                if int(out.at[idx, "is_correction"]) == 1 and last_anchor and last_date and out.at[idx, "rcept_dt"]:
-                    d_now = pd.to_datetime(out.at[idx, "rcept_dt"], errors="coerce")
-                    d_prev = pd.to_datetime(last_date, errors="coerce")
-                    if (not pd.isna(d_now)) and (not pd.isna(d_prev)) and (d_now - d_prev).days <= 365:
+                is_corr = int(out.at[idx, "is_correction"]) == 1
+                is_cancel = int(out.at[idx, "is_cancel"]) == 1
+                if (is_corr or is_cancel) and last_anchor:
+                    if last_date and out.at[idx, "rcept_dt"]:
+                        d_now = pd.to_datetime(out.at[idx, "rcept_dt"], errors="coerce")
+                        d_prev = pd.to_datetime(last_date, errors="coerce")
+                        if (not pd.isna(d_now)) and (not pd.isna(d_prev)):
+                            day_gap = (d_now - d_prev).days
+                            # 정정은 좁게(1년), 취소/철회는 넓게(10년) 허용
+                            # 취소 공시는 대상 라인이 비어있는 경우가 잦아 이전 anchor 연결이 중요.
+                            max_gap = 365 if is_corr else 3650
+                            if day_gap <= max_gap:
+                                anchor = last_anchor
+                    else:
                         anchor = last_anchor
                 if not anchor:
                     anchor = out.at[idx, "rcept_no"]
@@ -1046,7 +1065,14 @@ def _truncate_tables(conn: pymysql.connections.Connection, t: TableNames) -> Non
     conn.commit()
 
 
-def _insert_df(conn: pymysql.connections.Connection, table: str, df: pd.DataFrame, cols: list[str], batch_size: int = 1000) -> int:
+def _insert_df(
+    conn: pymysql.connections.Connection,
+    table: str,
+    df: pd.DataFrame,
+    cols: list[str],
+    batch_size: int = 1000,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> int:
     if df.empty:
         return 0
     table = _safe_table_name(table)
@@ -1071,6 +1097,8 @@ def _insert_df(conn: pymysql.connections.Connection, table: str, df: pd.DataFram
             chunk = data[i : i + batch_size]
             cur.executemany(sql, chunk)
             inserted += len(chunk)
+            if progress_cb is not None:
+                progress_cb(inserted, len(data))
     conn.commit()
     return inserted
 
@@ -1225,6 +1253,25 @@ def _to_legacy_frames(
     # 4) families
     topic_map = disclosures_df.groupby("family_group_key", as_index=False).agg(topic_key=("report_family_key", "first"))
     famx = fam_df.merge(topic_map, on="family_group_key", how="left")
+    for c in ["family_size", "has_correction", "has_cancel"]:
+        if c not in famx.columns:
+            famx[c] = 0
+    famx["family_size"] = famx["family_size"].fillna(0).astype(int)
+    famx["has_correction"] = famx["has_correction"].fillna(0).astype(int)
+    famx["has_cancel"] = famx["has_cancel"].fillna(0).astype(int)
+
+    # "실제 family"만 별도 family 테이블에 적재:
+    # - 멤버가 2개 이상이거나
+    # - 정정/취소 문맥이 있는 경우
+    famx["is_real_family"] = (
+        (famx["family_size"] >= 2)
+        | (famx["has_correction"] > 0)
+        | (famx["has_cancel"] > 0)
+    ).astype(int)
+    real_family_keys = set(
+        famx.loc[famx["is_real_family"] == 1, "family_group_key"].astype(str).tolist()
+    )
+
     # family_id는 사람이 읽을 수 있는 키로 유지한다: corp_code:anchor_rcept_no
     famx["family_id"] = famx["family_group_key"]
     famx["topic_key"] = famx["topic_key"].fillna("UNKNOWN")
@@ -1233,7 +1280,7 @@ def _to_legacy_frames(
         lambda r: 0.95 if int(r.get("has_correction", 0)) == 1 else 0.8,
         axis=1,
     )
-    families_legacy = famx[
+    families_legacy = famx[famx["is_real_family"] == 1][
         [
             "family_group_key",
             "family_id",
@@ -1246,7 +1293,9 @@ def _to_legacy_frames(
     ].copy().rename(columns={"family_anchor_rcept_no": "root_rcept_no"})
 
     # 5) family members
-    memx = mem_df.copy().sort_values(["family_group_key", "seq_no"]).reset_index(drop=True)
+    memx = mem_df.copy()
+    memx = memx[memx["family_group_key"].astype(str).isin(real_family_keys)].copy()
+    memx = memx.sort_values(["family_group_key", "seq_no"]).reset_index(drop=True)
     memx["family_id"] = memx["family_group_key"]
     memx["parent_rcept_no"] = memx.groupby("family_group_key")["rcept_no"].shift(1)
     memx["version_no"] = memx["seq_no"].astype(int)
@@ -1321,7 +1370,11 @@ def _to_legacy_frames(
             ]
         )
     else:
-        ev["family_id"] = ev["family_group_key"]
+        # 일반(비정정/비취소/단일 멤버) 공시는 family_id를 비워
+        # edge 이벤트는 유지하되 family 체인으로는 보지 않음.
+        ev["family_id"] = ev["family_group_key"].map(
+            lambda x: _to_str(x) if _to_str(x) in real_family_keys else None
+        )
         ev["target_name_norm"] = ev["target_key"]
         ev["event_effect_sign"] = ev["amount_delta"].map(lambda x: 1 if float(x) > 0 else (-1 if float(x) < 0 else 0))
         ev.loc[(ev["event_effect_sign"] == 0) & (ev["qty_delta"] > 0), "event_effect_sign"] = 1
@@ -1495,6 +1548,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-limit", type=int, default=None, help="Optional max source rows to load after filter.")
     parser.add_argument("--truncate-target", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--progress-file",
+        default=".advanced_db_build_progress.json",
+        help="Path to JSON progress file written during run.",
+    )
     return parser.parse_args()
 
 
@@ -1505,6 +1563,50 @@ def main() -> None:
     db = _load_db_config()
     tables = _build_table_names(args.table_suffix)
     raw_dir = Path(args.raw_dir)
+    progress_path = Path(args.progress_file)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    progress: dict[str, Any] = {
+        "run_id": run_id,
+        "status": "starting",
+        "step": "init",
+        "source_table": args.source_table,
+        "table_suffix": args.table_suffix,
+        "raw_dir": str(raw_dir),
+        "corp_code_filter": args.corp_code,
+        "sample_limit": args.sample_limit,
+        "truncate_target": bool(args.truncate_target),
+        "dry_run": bool(args.dry_run),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    def _mark_step(step: str, status: str = "running", print_line: bool = True, **fields: Any) -> None:
+        progress["step"] = step
+        progress["status"] = status
+        progress["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        for k, v in fields.items():
+            if isinstance(v, (datetime, date, pd.Timestamp)):
+                progress[k] = str(v)
+            else:
+                progress[k] = v
+        _write_json_atomic(progress_path, progress)
+        if print_line:
+            print(f"[STEP] {step} ({status})")
+
+    def _chunk_cb(step_name: str) -> Callable[[int, int], None]:
+        def _cb(done: int, total: int) -> None:
+            _mark_step(
+                step_name,
+                status="running",
+                print_line=False,
+                **{f"{step_name}_progress": f"{done}/{total}"},
+            )
+            if done == total or done % 5000 == 0:
+                print(f"[STEP] {step_name} progress {done:,}/{total:,}")
+
+        return _cb
+
+    _mark_step("init", "running")
 
     conn = pymysql.connect(
         host=db.host,
@@ -1518,259 +1620,357 @@ def main() -> None:
     )
 
     try:
-        corp_filter = _norm_corp_code(args.corp_code) if args.corp_code else None
-        source_df = _load_source_rows(
-            conn,
-            args.source_table,
-            corp_code_filter=corp_filter,
-            sample_limit=args.sample_limit,
-        )
-        if source_df.empty:
-            raise RuntimeError("No source rows loaded. Check source table and report filter.")
-        print(
-            f"[LOAD] source_rows={len(source_df):,}"
-            f", corp_code_filter={corp_filter or 'ALL'}"
-            f", sample_limit={args.sample_limit if args.sample_limit else 'NONE'}"
-        )
-
-        evidence_df = _load_raw_evidence(raw_dir)
-        print(f"[LOAD] raw_evidence_rows={len(evidence_df):,} from {raw_dir}")
-
-        disclosures_df = _prepare_disclosures(source_df, evidence_df)
-        lines_df, snapshot_df = _prepare_lines(source_df, disclosures_df)
-        events_df = _build_edge_events(disclosures_df, snapshot_df)
-        state_current_df, state_daily_df = _build_states(events_df)
-
-        fam_df = (
-            disclosures_df.groupby("family_group_key", as_index=False)
-            .agg(
-                corp_code=("corp_code", "first"),
-                family_anchor_rcept_no=("family_anchor_rcept_no", "first"),
-                first_rcept_dt=("rcept_dt", "min"),
-                last_rcept_dt=("rcept_dt", "max"),
-                family_size=("rcept_no", "nunique"),
-                has_correction=("is_correction", "max"),
-                has_cancel=("is_cancel", "max"),
-                member_rcepts_json=("rcept_no", lambda s: json.dumps(sorted(set([_to_str(x) for x in s if _to_str(x)])), ensure_ascii=False)),
+        try:
+            _mark_step("load_source", "running")
+            corp_filter = _norm_corp_code(args.corp_code) if args.corp_code else None
+            source_df = _load_source_rows(
+                conn,
+                args.source_table,
+                corp_code_filter=corp_filter,
+                sample_limit=args.sample_limit,
             )
-        )
-
-        mem = disclosures_df.sort_values(["family_group_key", "rcept_dt", "rcept_no"]).copy()
-        mem["seq_no"] = mem.groupby("family_group_key").cumcount() + 1
-        mem["is_anchor"] = (mem["rcept_no"] == mem["family_anchor_rcept_no"]).astype(int)
-        mem["relation_type"] = "UPDATE"
-        mem.loc[mem["is_anchor"] == 1, "relation_type"] = "ROOT"
-        mem.loc[mem["is_correction"] == 1, "relation_type"] = "CORRECTION"
-        mem.loc[mem["is_cancel"] == 1, "relation_type"] = "CANCEL"
-        mem_df = mem[
-            [
-                "family_group_key",
-                "seq_no",
-                "rcept_no",
-                "rcept_dt",
-                "report_nm",
-                "is_anchor",
-                "is_correction",
-                "is_cancel",
-                "relation_type",
-            ]
-        ].copy()
-
-        valid_alias = lines_df[(lines_df["is_target_valid"] == True) & (lines_df["target_key"] != "")].copy()
-        investee_dim_df = (
-            valid_alias.groupby("target_key", as_index=False)
-            .agg(
-                canonical_name=("target_clean", _pick_longest_name),
-                alias_count=("target_clean", lambda s: len(set([_clean_text(x) for x in s if _clean_text(x)]))),
-                aliases_json=("target_clean", lambda s: json.dumps(sorted(set([_clean_text(x) for x in s if _clean_text(x)])), ensure_ascii=False)),
+            if source_df.empty:
+                raise RuntimeError("No source rows loaded. Check source table and report filter.")
+            print(
+                f"[LOAD] source_rows={len(source_df):,}"
+                f", corp_code_filter={corp_filter or 'ALL'}"
+                f", sample_limit={args.sample_limit if args.sample_limit else 'NONE'}"
             )
-        )
+            _mark_step("load_source", "done", source_rows=int(len(source_df)), corp_code_filter=corp_filter or "ALL")
 
-        print(
-            "[BUILD] "
-            f"disclosures={len(disclosures_df):,}, "
-            f"lines={len(lines_df):,}, families={len(fam_df):,}, "
-            f"family_members={len(mem_df):,}, events={len(events_df):,}, "
-            f"state_current={len(state_current_df):,}, state_daily={len(state_daily_df):,}"
-        )
+            _mark_step("load_evidence", "running")
+            evidence_df = _load_raw_evidence(raw_dir)
+            print(f"[LOAD] raw_evidence_rows={len(evidence_df):,} from {raw_dir}")
+            _mark_step("load_evidence", "done", raw_evidence_rows=int(len(evidence_df)))
 
-        if args.dry_run:
-            print("[DRY-RUN] Table DDL/data insert skipped.")
-            return
+            _mark_step("build_frames", "running")
+            disclosures_df = _prepare_disclosures(source_df, evidence_df)
+            lines_df, snapshot_df = _prepare_lines(source_df, disclosures_df)
+            events_df = _build_edge_events(disclosures_df, snapshot_df)
+            state_current_df, state_daily_df = _build_states(events_df)
 
-        _create_tables(conn, tables)
-        if args.truncate_target:
-            _truncate_tables(conn, tables)
-
-        edge_event_cols = _load_table_columns(conn, tables.edge_events)
-        legacy_mode = "edge_event_id" in edge_event_cols
-
-        if not legacy_mode:
-            raise RuntimeError(
-                "Current script supports legacy no-v2 schema in this run. "
-                "Detected edge_events table without edge_event_id."
+            fam_df = (
+                disclosures_df.groupby("family_group_key", as_index=False)
+                .agg(
+                    corp_code=("corp_code", "first"),
+                    family_anchor_rcept_no=("family_anchor_rcept_no", "first"),
+                    first_rcept_dt=("rcept_dt", "min"),
+                    last_rcept_dt=("rcept_dt", "max"),
+                    family_size=("rcept_no", "nunique"),
+                    has_correction=("is_correction", "max"),
+                    has_cancel=("is_cancel", "max"),
+                    member_rcepts_json=("rcept_no", lambda s: json.dumps(sorted(set([_to_str(x) for x in s if _to_str(x)])), ensure_ascii=False)),
+                )
             )
 
-        frames = _to_legacy_frames(disclosures_df, lines_df, fam_df, mem_df, events_df)
-        disclosures_legacy = frames["disclosures"]
-        investee_dim = frames["investee_dim"]
-        lines_legacy = frames["lines"]
-        families_legacy = frames["families"]
-        members_legacy = frames["members"]
-        edge_events_legacy = frames["edge_events"]
+            mem = disclosures_df.sort_values(["family_group_key", "rcept_dt", "rcept_no"]).copy()
+            mem["seq_no"] = mem.groupby("family_group_key").cumcount() + 1
+            mem["is_anchor"] = (mem["rcept_no"] == mem["family_anchor_rcept_no"]).astype(int)
+            mem["relation_type"] = "UPDATE"
+            mem.loc[mem["is_anchor"] == 1, "relation_type"] = "ROOT"
+            mem.loc[mem["is_correction"] == 1, "relation_type"] = "CORRECTION"
+            mem.loc[mem["is_cancel"] == 1, "relation_type"] = "CANCEL"
+            mem_df = mem[
+                [
+                    "family_group_key",
+                    "seq_no",
+                    "rcept_no",
+                    "rcept_dt",
+                    "report_nm",
+                    "is_anchor",
+                    "is_correction",
+                    "is_cancel",
+                    "relation_type",
+                ]
+            ].copy()
 
-        ins_disclosures = _insert_df(
-            conn,
-            tables.disclosures,
-            disclosures_legacy,
-            ["rcept_no", "rcept_dt", "corp_cls", "corp_code", "corp_name", "report_nm", "flr_nm", "pblntf_ty", "viewer_url"],
-        )
-
-        ins_dim = _insert_df(
-            conn,
-            tables.investee_dim,
-            investee_dim,
-            ["name_norm", "name_canonical", "stock_code", "corp_code", "alias_json"],
-        )
-
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT investee_id, name_norm FROM {tables.investee_dim}")
-            investee_map = {str(r["name_norm"]): int(r["investee_id"]) for r in cur.fetchall()}
-
-        ins_lines = _insert_df(
-            conn,
-            tables.lines,
-            lines_legacy,
-            [
-                "rcept_no",
-                "line_no",
-                "corp_code",
-                "corp_name",
-                "source",
-                "viewer_url",
-                "iscmp_cmpnm_raw",
-                "iscmp_cmpnm_norm",
-                "trfdtl_trfprc",
-                "trfdtl_stkcnt",
-                "trf_pp",
-                "note_text",
-                "parse_method",
-                "parse_confidence",
-                "parse_evidence",
-                "parse_version",
-                "event_action_hint",
-                "row_hash",
-                "etl_run_id",
-            ],
-        )
-
-        ins_families = _insert_df(
-            conn,
-            tables.families,
-            families_legacy,
-            ["family_id", "corp_code", "topic_key", "root_rcept_no", "resolve_method", "resolve_conf"],
-        )
-
-        ins_members = _insert_df(
-            conn,
-            tables.family_members,
-            members_legacy,
-            ["family_id", "rcept_no", "parent_rcept_no", "version_no", "relation_type", "effective_dt", "confidence"],
-        )
-
-        edge_events_legacy = edge_events_legacy.copy()
-        edge_events_legacy["investee_id"] = edge_events_legacy["target_name_norm"].map(investee_map)
-        edge_events_legacy = edge_events_legacy.drop_duplicates(subset=["row_hash"], keep="first")
-        ins_events = _insert_df(
-            conn,
-            tables.edge_events,
-            edge_events_legacy,
-            [
-                "rcept_no",
-                "family_id",
-                "corp_code",
-                "corp_name",
-                "investee_id",
-                "target_name_norm",
-                "event_action",
-                "event_effect_sign",
-                "delta_amount",
-                "delta_shares",
-                "reason_text",
-                "rcept_dt",
-                "effective_dt",
-                "confidence",
-                "row_hash",
-            ],
-        )
-
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT edge_event_id, rcept_no, corp_code, corp_name, target_name_norm,
-                       event_action, delta_amount, delta_shares, effective_dt
-                FROM {tables.edge_events}
-                ORDER BY edge_event_id ASC
-                """
+            real_family_count = int(
+                (
+                    (fam_df["family_size"].fillna(0).astype(int) >= 2)
+                    | (fam_df["has_correction"].fillna(0).astype(int) > 0)
+                    | (fam_df["has_cancel"].fillna(0).astype(int) > 0)
+                ).sum()
             )
-            edge_db_df = pd.DataFrame(cur.fetchall())
 
-        state_current_legacy, state_daily_legacy = _prepare_legacy_states(edge_db_df)
-        state_current_legacy["investee_id"] = state_current_legacy["target_name_norm"].map(investee_map)
-        state_daily_legacy["investee_id"] = state_daily_legacy["target_name_norm"].map(investee_map)
+            valid_alias = lines_df[(lines_df["is_target_valid"] == True) & (lines_df["target_key"] != "")].copy()
+            investee_dim_df = (
+                valid_alias.groupby("target_key", as_index=False)
+                .agg(
+                    canonical_name=("target_clean", _pick_longest_name),
+                    alias_count=("target_clean", lambda s: len(set([_clean_text(x) for x in s if _clean_text(x)]))),
+                    aliases_json=("target_clean", lambda s: json.dumps(sorted(set([_clean_text(x) for x in s if _clean_text(x)])), ensure_ascii=False)),
+                )
+            )
 
-        ins_curr = _insert_df(
-            conn,
-            tables.edge_state_current,
-            state_current_legacy,
-            [
-                "corp_code",
-                "target_name_norm",
-                "investee_id",
-                "corp_name",
-                "active_flag",
-                "first_connected_dt",
-                "last_changed_dt",
-                "closed_dt",
-                "holding_amount",
-                "holding_shares",
-                "planned_amount",
-                "planned_shares",
-                "last_rcept_no",
-                "last_edge_event_id",
-            ],
-        )
+            print(
+                "[BUILD] "
+                f"disclosures={len(disclosures_df):,}, "
+                f"lines={len(lines_df):,}, families={len(fam_df):,}, "
+                f"real_families={real_family_count:,}, "
+                f"family_members={len(mem_df):,}, events={len(events_df):,}, "
+                f"state_current={len(state_current_df):,}, state_daily={len(state_daily_df):,}"
+            )
+            _mark_step(
+                "build_frames",
+                "done",
+                disclosures=int(len(disclosures_df)),
+                lines=int(len(lines_df)),
+                families=int(len(fam_df)),
+                real_families=real_family_count,
+                family_members=int(len(mem_df)),
+                events=int(len(events_df)),
+                state_current=int(len(state_current_df)),
+                state_daily=int(len(state_daily_df)),
+            )
 
-        ins_daily = _insert_df(
-            conn,
-            tables.edge_state_daily,
-            state_daily_legacy,
-            [
-                "as_of_date",
-                "corp_code",
-                "target_name_norm",
-                "investee_id",
-                "active_flag",
-                "holding_amount",
-                "holding_shares",
-                "planned_amount",
-                "planned_shares",
-                "last_rcept_no",
-                "last_edge_event_id",
-            ],
-        )
+            if args.dry_run:
+                print("[DRY-RUN] Table DDL/data insert skipped.")
+                _mark_step("done", "completed", dry_run=True)
+                return
 
-        print(
-            "[DONE] "
-            f"{tables.disclosures}={ins_disclosures:,}, "
-            f"{tables.lines}={ins_lines:,}, "
-            f"{tables.families}={ins_families:,}, "
-            f"{tables.family_members}={ins_members:,}, "
-            f"{tables.investee_dim}={ins_dim:,}, "
-            f"{tables.edge_events}={ins_events:,}, "
-            f"{tables.edge_state_current}={ins_curr:,}, "
-            f"{tables.edge_state_daily}={ins_daily:,}"
-        )
+            _mark_step("create_tables", "running")
+            _create_tables(conn, tables)
+            _mark_step("create_tables", "done")
+
+            if args.truncate_target:
+                _mark_step("truncate_target", "running")
+                _truncate_tables(conn, tables)
+                _mark_step("truncate_target", "done")
+
+            _mark_step("check_schema", "running")
+            edge_event_cols = _load_table_columns(conn, tables.edge_events)
+            legacy_mode = "edge_event_id" in edge_event_cols
+            if not legacy_mode:
+                raise RuntimeError(
+                    "Current script supports legacy no-v2 schema in this run. "
+                    "Detected edge_events table without edge_event_id."
+                )
+            _mark_step("check_schema", "done", legacy_mode=bool(legacy_mode))
+
+            _mark_step("to_legacy_frames", "running")
+            frames = _to_legacy_frames(disclosures_df, lines_df, fam_df, mem_df, events_df)
+            disclosures_legacy = frames["disclosures"]
+            investee_dim = frames["investee_dim"]
+            lines_legacy = frames["lines"]
+            families_legacy = frames["families"]
+            members_legacy = frames["members"]
+            edge_events_legacy = frames["edge_events"]
+            _mark_step(
+                "to_legacy_frames",
+                "done",
+                legacy_disclosures=int(len(disclosures_legacy)),
+                legacy_lines=int(len(lines_legacy)),
+                legacy_families=int(len(families_legacy)),
+                legacy_members=int(len(members_legacy)),
+                legacy_events=int(len(edge_events_legacy)),
+            )
+
+            _mark_step("insert_disclosures", "running")
+            ins_disclosures = _insert_df(
+                conn,
+                tables.disclosures,
+                disclosures_legacy,
+                ["rcept_no", "rcept_dt", "corp_cls", "corp_code", "corp_name", "report_nm", "flr_nm", "pblntf_ty", "viewer_url"],
+                progress_cb=_chunk_cb("insert_disclosures"),
+            )
+            _mark_step("insert_disclosures", "done", inserted_disclosures=int(ins_disclosures))
+
+            _mark_step("insert_investee_dim", "running")
+            ins_dim = _insert_df(
+                conn,
+                tables.investee_dim,
+                investee_dim,
+                ["name_norm", "name_canonical", "stock_code", "corp_code", "alias_json"],
+                progress_cb=_chunk_cb("insert_investee_dim"),
+            )
+            _mark_step("insert_investee_dim", "done", inserted_investee_dim=int(ins_dim))
+
+            _mark_step("load_investee_map", "running")
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT investee_id, name_norm FROM {tables.investee_dim}")
+                investee_map = {str(r["name_norm"]): int(r["investee_id"]) for r in cur.fetchall()}
+            _mark_step("load_investee_map", "done", investee_map_size=int(len(investee_map)))
+
+            _mark_step("insert_lines", "running")
+            ins_lines = _insert_df(
+                conn,
+                tables.lines,
+                lines_legacy,
+                [
+                    "rcept_no",
+                    "line_no",
+                    "corp_code",
+                    "corp_name",
+                    "source",
+                    "viewer_url",
+                    "iscmp_cmpnm_raw",
+                    "iscmp_cmpnm_norm",
+                    "trfdtl_trfprc",
+                    "trfdtl_stkcnt",
+                    "trf_pp",
+                    "note_text",
+                    "parse_method",
+                    "parse_confidence",
+                    "parse_evidence",
+                    "parse_version",
+                    "event_action_hint",
+                    "row_hash",
+                    "etl_run_id",
+                ],
+                progress_cb=_chunk_cb("insert_lines"),
+            )
+            _mark_step("insert_lines", "done", inserted_lines=int(ins_lines))
+
+            _mark_step("insert_families", "running")
+            ins_families = _insert_df(
+                conn,
+                tables.families,
+                families_legacy,
+                ["family_id", "corp_code", "topic_key", "root_rcept_no", "resolve_method", "resolve_conf"],
+                progress_cb=_chunk_cb("insert_families"),
+            )
+            _mark_step("insert_families", "done", inserted_families=int(ins_families))
+
+            _mark_step("insert_family_members", "running")
+            ins_members = _insert_df(
+                conn,
+                tables.family_members,
+                members_legacy,
+                ["family_id", "rcept_no", "parent_rcept_no", "version_no", "relation_type", "effective_dt", "confidence"],
+                progress_cb=_chunk_cb("insert_family_members"),
+            )
+            _mark_step("insert_family_members", "done", inserted_family_members=int(ins_members))
+
+            _mark_step("insert_edge_events", "running")
+            edge_events_legacy = edge_events_legacy.copy()
+            edge_events_legacy["investee_id"] = edge_events_legacy["target_name_norm"].map(investee_map)
+            edge_events_legacy = edge_events_legacy.drop_duplicates(subset=["row_hash"], keep="first")
+            ins_events = _insert_df(
+                conn,
+                tables.edge_events,
+                edge_events_legacy,
+                [
+                    "rcept_no",
+                    "family_id",
+                    "corp_code",
+                    "corp_name",
+                    "investee_id",
+                    "target_name_norm",
+                    "event_action",
+                    "event_effect_sign",
+                    "delta_amount",
+                    "delta_shares",
+                    "reason_text",
+                    "rcept_dt",
+                    "effective_dt",
+                    "confidence",
+                    "row_hash",
+                ],
+                progress_cb=_chunk_cb("insert_edge_events"),
+            )
+            _mark_step("insert_edge_events", "done", inserted_edge_events=int(ins_events))
+
+            _mark_step("build_state_legacy", "running")
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT edge_event_id, rcept_no, corp_code, corp_name, target_name_norm,
+                           event_action, delta_amount, delta_shares, effective_dt
+                    FROM {tables.edge_events}
+                    ORDER BY edge_event_id ASC
+                    """
+                )
+                edge_db_df = pd.DataFrame(cur.fetchall())
+
+            state_current_legacy, state_daily_legacy = _prepare_legacy_states(edge_db_df)
+            state_current_legacy["investee_id"] = state_current_legacy["target_name_norm"].map(investee_map)
+            state_daily_legacy["investee_id"] = state_daily_legacy["target_name_norm"].map(investee_map)
+            _mark_step(
+                "build_state_legacy",
+                "done",
+                state_current_rows=int(len(state_current_legacy)),
+                state_daily_rows=int(len(state_daily_legacy)),
+            )
+
+            _mark_step("insert_state_current", "running")
+            ins_curr = _insert_df(
+                conn,
+                tables.edge_state_current,
+                state_current_legacy,
+                [
+                    "corp_code",
+                    "target_name_norm",
+                    "investee_id",
+                    "corp_name",
+                    "active_flag",
+                    "first_connected_dt",
+                    "last_changed_dt",
+                    "closed_dt",
+                    "holding_amount",
+                    "holding_shares",
+                    "planned_amount",
+                    "planned_shares",
+                    "last_rcept_no",
+                    "last_edge_event_id",
+                ],
+                progress_cb=_chunk_cb("insert_state_current"),
+            )
+            _mark_step("insert_state_current", "done", inserted_state_current=int(ins_curr))
+
+            _mark_step("insert_state_daily", "running")
+            ins_daily = _insert_df(
+                conn,
+                tables.edge_state_daily,
+                state_daily_legacy,
+                [
+                    "as_of_date",
+                    "corp_code",
+                    "target_name_norm",
+                    "investee_id",
+                    "active_flag",
+                    "holding_amount",
+                    "holding_shares",
+                    "planned_amount",
+                    "planned_shares",
+                    "last_rcept_no",
+                    "last_edge_event_id",
+                ],
+                progress_cb=_chunk_cb("insert_state_daily"),
+            )
+            _mark_step("insert_state_daily", "done", inserted_state_daily=int(ins_daily))
+
+            print(
+                "[DONE] "
+                f"{tables.disclosures}={ins_disclosures:,}, "
+                f"{tables.lines}={ins_lines:,}, "
+                f"{tables.families}={ins_families:,}, "
+                f"{tables.family_members}={ins_members:,}, "
+                f"{tables.investee_dim}={ins_dim:,}, "
+                f"{tables.edge_events}={ins_events:,}, "
+                f"{tables.edge_state_current}={ins_curr:,}, "
+                f"{tables.edge_state_daily}={ins_daily:,}"
+            )
+            _mark_step(
+                "done",
+                "completed",
+                inserted_disclosures=int(ins_disclosures),
+                inserted_lines=int(ins_lines),
+                inserted_families=int(ins_families),
+                inserted_family_members=int(ins_members),
+                inserted_investee_dim=int(ins_dim),
+                inserted_edge_events=int(ins_events),
+                inserted_state_current=int(ins_curr),
+                inserted_state_daily=int(ins_daily),
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        except BaseException as exc:
+            _mark_step(
+                "failed",
+                "failed",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            raise
     finally:
         conn.close()
 

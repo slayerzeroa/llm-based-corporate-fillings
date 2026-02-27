@@ -48,7 +48,7 @@ REPORT_CODES = {"Q1": "11013", "H1": "11012", "Q3": "11014", "Y": "11011"}
 # ------------------------------------------------------------
 # Transfer constants
 # ------------------------------------------------------------
-TRANSFER_TITLE_REGEX = r"타법인\s*주식\s*및\s*출자증권\s*(처분결정|양도결정)"
+TRANSFER_TITLE_REGEX = r"타법인\s*주식\s*및\s*출자증권\s*(?:처분결정|양도결정|취득결정|양수결정)"
 
 TRF_DETAIL_COLS = [
     "iscmp_cmpnm", "iscmp_nt", "iscmp_rp", "iscmp_cpt", "iscmp_rl_cmpn", "iscmp_tisstk", "iscmp_mbsn",
@@ -234,22 +234,40 @@ class OpenDartClient:
     timeout: int = 30
     max_retries: int = 5
     base_sleep: float = 0.8
+    request_interval_sec: float = 0.0
     session: requests.Session = field(default_factory=requests.Session)
     _corp_cache: Optional[pd.DataFrame] = None
+    _last_request_monotonic: float = field(default=0.0, init=False)
 
     def __post_init__(self):
         if not self.api_key:
             raise ValueError("api_key is required.")
+        self.request_interval_sec = max(float(self.request_interval_sec), 0.0)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0",
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         })
 
+    def _apply_request_interval(self) -> None:
+        if self.request_interval_sec <= 0:
+            return
+        now = time.monotonic()
+        if self._last_request_monotonic > 0:
+            elapsed = now - self._last_request_monotonic
+            wait_sec = self.request_interval_sec - elapsed
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+        self._last_request_monotonic = time.monotonic()
+
+    def _session_get(self, url: str, **kwargs):
+        self._apply_request_interval()
+        return self.session.get(url, **kwargs)
+
     # ---------- low-level ----------
     def _call_json(self, url: str, **params) -> dict:
         payload = {"crtfc_key": self.api_key, **params}
         for attempt in range(self.max_retries):
-            r = self.session.get(url, params=payload, timeout=self.timeout)
+            r = self._session_get(url, params=payload, timeout=self.timeout)
             r.raise_for_status()
             js = r.json()
             status = js.get("status", "")
@@ -383,7 +401,7 @@ class OpenDartClient:
 
         for attempt in range(self.max_retries):
             try:
-                r = self.session.get(BASE_CORPCODE_URL, params=payload, timeout=self.timeout)
+                r = self._session_get(BASE_CORPCODE_URL, params=payload, timeout=self.timeout)
                 r.raise_for_status()
                 content = r.content or b""
             except requests.RequestException as exc:
@@ -991,7 +1009,7 @@ class OpenDartClient:
         return scored[0][1]
 
     def _fetch_viewer_html_by_rcpno(self, rcp_no: str) -> Tuple[Optional[str], str]:
-        main_resp = self.session.get(MAIN_URL, params={"rcpNo": rcp_no}, timeout=self.timeout)
+        main_resp = self._session_get(MAIN_URL, params={"rcpNo": rcp_no}, timeout=self.timeout)
         main_resp.raise_for_status()
         main_html = main_resp.text
 
@@ -1009,7 +1027,7 @@ class OpenDartClient:
             "length": best["length"],
             "dtd": best["dtd"],
         }
-        vresp = self.session.get(VIEWER_URL, params=params, timeout=self.timeout)
+        vresp = self._session_get(VIEWER_URL, params=params, timeout=self.timeout)
         vresp.raise_for_status()
         return vresp.text, "VIEWER_HTML"
 
@@ -1119,7 +1137,7 @@ class OpenDartClient:
             try:
                 if verbose:
                     print("[2/2] document.xml fallback 파싱 시작")
-                resp = self.session.get(
+                resp = self._session_get(
                     BASE_DOCUMENT_URL,
                     params={"crtfc_key": self.api_key, "rcept_no": rcp_no},
                     timeout=self.timeout

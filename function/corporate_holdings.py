@@ -434,8 +434,15 @@ def _fetch_viewer_html_by_rcpno(
     rcp_no: str,
     session: requests.Session,
     timeout: int = 30,
+    request_interval_sec: float = 0.0,
 ) -> Tuple[Optional[str], str]:
-    main_resp = session.get(MAIN_URL, params={"rcpNo": rcp_no}, timeout=timeout)
+    main_resp = _throttled_session_get(
+        session,
+        MAIN_URL,
+        params={"rcpNo": rcp_no},
+        timeout=timeout,
+        min_interval_sec=request_interval_sec,
+    )
     main_resp.raise_for_status()
     main_html = main_resp.text
 
@@ -452,7 +459,13 @@ def _fetch_viewer_html_by_rcpno(
         "length": best["length"],
         "dtd": best["dtd"],
     }
-    vresp = session.get(VIEWER_URL, params=params, timeout=timeout)
+    vresp = _throttled_session_get(
+        session,
+        VIEWER_URL,
+        params=params,
+        timeout=timeout,
+        min_interval_sec=request_interval_sec,
+    )
     vresp.raise_for_status()
     return vresp.text, "VIEWER_HTML"
 
@@ -878,6 +891,32 @@ def _parse_note_plan_items(note_text: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _throttled_session_get(
+    session: requests.Session,
+    url: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+    timeout: int = 30,
+    min_interval_sec: float = 0.0,
+) -> requests.Response:
+    configured = getattr(session, "_dart_request_interval_sec", None)
+    interval = configured if configured is not None else min_interval_sec
+    try:
+        interval_sec = max(float(interval), 0.0)
+    except Exception:
+        interval_sec = 0.0
+
+    if interval_sec > 0:
+        now = time.monotonic()
+        last = getattr(session, "_dart_last_request_monotonic", 0.0) or 0.0
+        wait_sec = interval_sec - (now - float(last))
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+        setattr(session, "_dart_last_request_monotonic", time.monotonic())
+
+    return session.get(url, params=params, timeout=timeout)
+
+
 def call_json(
     api_key: str,
     url: str,
@@ -886,6 +925,7 @@ def call_json(
     timeout: int = 30,
     max_retries: int = 5,
     base_sleep: float = 0.8,
+    request_interval_sec: float = 0.0,
 ) -> dict:
     if params is None:
         params = {}
@@ -894,7 +934,13 @@ def call_json(
     sess = session or requests.Session()
 
     for attempt in range(max_retries):
-        r = sess.get(url, params=payload, timeout=timeout)
+        r = _throttled_session_get(
+            sess,
+            url,
+            params=payload,
+            timeout=timeout,
+            min_interval_sec=request_interval_sec,
+        )
         r.raise_for_status()
         js = r.json()
         st = js.get("status", "")
@@ -917,6 +963,7 @@ def list_all_pages(
     timeout: int = 30,
     max_retries: int = 5,
     base_sleep: float = 0.8,
+    request_interval_sec: float = 0.0,
 ) -> List[dict]:
     sess = session or requests.Session()
     first = call_json(
@@ -927,6 +974,7 @@ def list_all_pages(
         timeout=timeout,
         max_retries=max_retries,
         base_sleep=base_sleep,
+        request_interval_sec=request_interval_sec,
     )
     if first.get("status") == "013":
         return []
@@ -943,6 +991,7 @@ def list_all_pages(
             timeout=timeout,
             max_retries=max_retries,
             base_sleep=base_sleep,
+            request_interval_sec=request_interval_sec,
         )
         st = js.get("status", "")
         if st == "000":
@@ -964,6 +1013,7 @@ def fetch_transfer_list(
     timeout: int = 30,
     max_retries: int = 5,
     base_sleep: float = 0.8,
+    request_interval_sec: float = 0.0,
     session: Optional[requests.Session] = None,
 ) -> pd.DataFrame:
     corp_code = str(corp_code).zfill(8)
@@ -990,6 +1040,7 @@ def fetch_transfer_list(
             timeout=timeout,
             max_retries=max_retries,
             base_sleep=base_sleep,
+            request_interval_sec=request_interval_sec,
         )
         if not rows:
             continue
@@ -1042,6 +1093,7 @@ def fetch_transfer_list_standalone(
     timeout: int = 30,
     max_retries: int = 5,
     base_sleep: float = 0.8,
+    request_interval_sec: float = 0.0,
 ) -> pd.DataFrame:
     return fetch_transfer_list(
         api_key=api_key,
@@ -1052,6 +1104,7 @@ def fetch_transfer_list_standalone(
         timeout=timeout,
         max_retries=max_retries,
         base_sleep=base_sleep,
+        request_interval_sec=request_interval_sec,
     )
 
 
@@ -1061,6 +1114,8 @@ def extract_transfer_decision_from_viewer_url(
     timeout: int = 30,
     verbose: bool = True,
     seed_row: Optional[Union[Dict[str, Any], pd.Series]] = None,
+    session: Optional[requests.Session] = None,
+    request_interval_sec: float = 0.0,
 ) -> pd.DataFrame:
     rcp_no = _extract_rcp_no(viewer_url)
     seed = _seed_to_dict(seed_row)
@@ -1083,16 +1138,22 @@ def extract_transfer_decision_from_viewer_url(
     doc_raw_text = ""
     doc_zip_bytes = b""
 
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    })
+    sess = session or requests.Session()
+    if session is None:
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        })
 
     try:
         if verbose:
             print(f"[1] viewer HTML 파싱 시작: rcp_no={rcp_no}")
-        viewer_html, src = _fetch_viewer_html_by_rcpno(rcp_no, sess, timeout=timeout)
+        viewer_html, src = _fetch_viewer_html_by_rcpno(
+            rcp_no,
+            sess,
+            timeout=timeout,
+            request_interval_sec=request_interval_sec,
+        )
         if viewer_html:
             parsed = _extract_fields_from_html_text(viewer_html) or {}
             skip_identity = {"corp_name", "corp_code", "corp_cls", "flr_nm", "pblntf_ty", "rcept_no", "rcept_dt"}
@@ -1124,10 +1185,12 @@ def extract_transfer_decision_from_viewer_url(
         try:
             if verbose:
                 print("[2] document.zip 다운로드 시작")
-            resp = sess.get(
+            resp = _throttled_session_get(
+                sess,
                 DOCUMENT_URL,
                 params={"crtfc_key": api_key, "rcept_no": rcp_no},
                 timeout=timeout,
+                min_interval_sec=request_interval_sec,
             )
             resp.raise_for_status()
             doc_zip_bytes = resp.content
@@ -1254,22 +1317,35 @@ class CorporateHoldingsModule:
     timeout: int = 30
     max_retries: int = 5
     base_sleep: float = 0.8
+    request_interval_sec: float = 0.0
     client: OpenDartClient = field(init=False)
     session: requests.Session = field(init=False)
 
     def __post_init__(self) -> None:
+        self.request_interval_sec = max(float(self.request_interval_sec), 0.0)
         self.client = OpenDartClient(
             api_key=self.api_key,
             timeout=self.timeout,
             max_retries=self.max_retries,
             base_sleep=self.base_sleep,
+            request_interval_sec=self.request_interval_sec,
         )
         self.session = self.client.session
+        setattr(self.session, "_dart_request_interval_sec", self.request_interval_sec)
+
+    def _session_get(self, url: str, *, params: Optional[dict[str, Any]] = None) -> requests.Response:
+        return _throttled_session_get(
+            self.session,
+            url,
+            params=params,
+            timeout=self.timeout,
+            min_interval_sec=self.request_interval_sec,
+        )
 
     def _call_json(self, url: str, **params: Any) -> dict:
         payload = {"crtfc_key": self.api_key, **params}
         for attempt in range(self.max_retries):
-            resp = self.session.get(url, params=payload, timeout=self.timeout)
+            resp = self._session_get(url, params=payload)
             resp.raise_for_status()
             js = resp.json()
             status = js.get("status", "")
@@ -1466,7 +1542,7 @@ class CorporateHoldingsModule:
 
     def _fetch_viewer_plain_text(self, rcept_no: str) -> str:
         try:
-            resp = self.session.get(MAIN_URL, params={"rcpNo": str(rcept_no)}, timeout=self.timeout)
+            resp = self._session_get(MAIN_URL, params={"rcpNo": str(rcept_no)})
             resp.raise_for_status()
             main_html = resp.text
         except Exception:
@@ -1501,7 +1577,7 @@ class CorporateHoldingsModule:
             "dtd": best["dtd"],
         }
         try:
-            viewer = self.session.get(VIEWER_URL, params=params, timeout=self.timeout)
+            viewer = self._session_get(VIEWER_URL, params=params)
             viewer.raise_for_status()
             return _markup_to_text(viewer.text)
         except Exception:
@@ -1509,10 +1585,9 @@ class CorporateHoldingsModule:
 
     def _fetch_document_plain_text(self, rcept_no: str) -> str:
         try:
-            resp = self.session.get(
+            resp = self._session_get(
                 DOCUMENT_URL,
                 params={"crtfc_key": self.api_key, "rcept_no": str(rcept_no)},
-                timeout=self.timeout,
             )
             resp.raise_for_status()
         except Exception:
@@ -1529,7 +1604,7 @@ class CorporateHoldingsModule:
         corp_code: str,
         bgn_de: str,
         end_de: str,
-        max_reports: int = 200,
+        max_reports: Optional[int] = None,
         sleep_sec: float = 0.03,
         include_base_row: bool = True,
     ) -> pd.DataFrame:
@@ -1542,11 +1617,14 @@ class CorporateHoldingsModule:
             timeout=self.timeout,
             max_retries=self.max_retries,
             base_sleep=self.base_sleep,
+            request_interval_sec=self.request_interval_sec,
         )
         if list_df.empty:
             return _empty_output_df()
 
-        seeds = list_df.drop_duplicates(subset=["rcept_no"], keep="first").head(max_reports).copy()
+        seeds = list_df.drop_duplicates(subset=["rcept_no"], keep="first").copy()
+        if max_reports is not None and int(max_reports) > 0:
+            seeds = seeds.head(int(max_reports)).copy()
         chunks: List[pd.DataFrame] = []
 
         for _, seed in seeds.iterrows():
@@ -1563,6 +1641,8 @@ class CorporateHoldingsModule:
                 timeout=self.timeout,
                 verbose=False,
                 seed_row=seed,
+                session=self.session,
+                request_interval_sec=self.request_interval_sec,
             )
             if detail_df.empty:
                 if sleep_sec > 0:
@@ -1596,7 +1676,7 @@ class CorporateHoldingsModule:
         include_periodic_status: bool = False,
         include_majorstock_status: bool = False,
         include_transfer_note_plan: bool = True,
-        max_note_reports: int = 200,
+        max_note_reports: Optional[int] = None,
     ) -> dict[str, pd.DataFrame]:
         corp_code = str(corp_code).zfill(8)
         bgn = _norm_yyyymmdd(bgn_de)
@@ -1672,7 +1752,7 @@ class CorporateHoldingsModule:
         include_periodic_status: bool = False,
         include_majorstock_status: bool = False,
         include_transfer_note_plan: bool = True,
-        max_note_reports: int = 200,
+        max_note_reports: Optional[int] = None,
     ) -> tuple[str, str, str, dict[str, pd.DataFrame]]:
         corp_code, corp_name, stock_code = self.resolve_investor(investor)
         data = self.fetch_all_holding_dfs(
