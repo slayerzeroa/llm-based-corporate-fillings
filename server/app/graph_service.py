@@ -6,21 +6,23 @@ from collections import deque
 from collections import OrderedDict
 from threading import Lock
 import time
+from typing import Any
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from .config import ServerSettings
+from .config import ServerSettings, get_settings
 from .db import get_connection
 from .schemas import GraphQuery, GraphResponse, TopEdge
 
 SYSTEM_MAX_EDGES = 50
-GRAPH_CACHE_TTL_SEC = 20
-GRAPH_CACHE_MAX_ITEMS = 256
-STOCK_CACHE_TTL_SEC = 60
-STOCK_CACHE_MAX_ITEMS = 256
+_BOOT_SETTINGS = get_settings()
+GRAPH_CACHE_TTL_SEC = _BOOT_SETTINGS.graph_cache_ttl_sec
+GRAPH_CACHE_MAX_ITEMS = _BOOT_SETTINGS.graph_cache_max_items
+STOCK_CACHE_TTL_SEC = _BOOT_SETTINGS.stock_cache_ttl_sec
+STOCK_CACHE_MAX_ITEMS = _BOOT_SETTINGS.stock_cache_max_items
 
 
 class _TTLCache:
@@ -56,6 +58,32 @@ _GRAPH_CACHE = _TTLCache(max_items=GRAPH_CACHE_MAX_ITEMS, ttl_sec=GRAPH_CACHE_TT
 _STOCK_CACHE = _TTLCache(max_items=STOCK_CACHE_MAX_ITEMS, ttl_sec=STOCK_CACHE_TTL_SEC)
 
 
+def _empty_figure(title: str, *, include_figure: bool, height: int = 850) -> dict[str, Any]:
+    if not include_figure:
+        return {"data": [], "layout": {"title": title, "height": height}}
+    fig = go.Figure()
+    fig.update_layout(title=title, height=height)
+    return json.loads(fig.to_json())
+
+
+def _fetchall(
+    sql: str,
+    params: list[object] | tuple[object, ...] | None = None,
+    *,
+    conn=None,
+) -> list[dict[str, Any]]:
+    owns_conn = conn is None
+    use_conn = conn or get_connection()
+    try:
+        with use_conn.cursor() as cur:
+            cur.execute(sql, tuple(params or []))
+            rows = cur.fetchall()
+            return rows or []
+    finally:
+        if owns_conn:
+            use_conn.close()
+
+
 def _norm_yyyymmdd(value: str) -> str:
     raw = str(value).replace("-", "").strip()
     if len(raw) != 8 or not raw.isdigit():
@@ -76,135 +104,198 @@ def _norm_name(text: str) -> str:
     return s
 
 
-def _build_base_where(
+def _build_date_filters(
     *,
+    column_sql: str,
     start_date: str | None,
     end_date: str | None,
-    snapshot_date: str | None,
-    corp_name_filter: str | None,
+    snapshot_date: str | None = None,
+) -> tuple[list[str], list[object]]:
+    conditions: list[str] = []
+    params: list[object] = []
+    if start_date:
+        conditions.append(f"{column_sql} >= %s")
+        params.append(_to_date_str(start_date))
+    if end_date:
+        conditions.append(f"{column_sql} <= %s")
+        params.append(_to_date_str(end_date))
+    if snapshot_date:
+        conditions.append(f"{column_sql} <= %s")
+        params.append(_to_date_str(snapshot_date))
+    return conditions, params
+
+
+def _build_source_filter(
+    *,
+    alias: str,
     include_periodic_status: bool,
     include_majorstock_status: bool,
 ) -> tuple[str, list[object]]:
-    conditions = [
-        "rcept_dt IS NOT NULL",
-        "corp_name IS NOT NULL",
-        "iscmp_cmpnm IS NOT NULL",
-        "TRIM(corp_name) <> ''",
-        "TRIM(iscmp_cmpnm) <> ''",
-        "corp_name <> iscmp_cmpnm",
-        (
-            "REPLACE(TRIM(iscmp_cmpnm), ' ', '') NOT IN ("
-            "'합계','총계','소계',"
-            "'회사명','회사명(국적)','발행회사','대표자','대표이사','국적','성명',"
-            "'(회사명)','(회사명(국적))','(발행회사)','(대표자)','(대표이사)','(국적)','(성명)'"
-            ")"
-        ),
-    ]
+    conditions: list[str] = []
     params: list[object] = []
 
-    if start_date:
-        conditions.append("rcept_dt >= %s")
-        params.append(_to_date_str(start_date))
-    if end_date:
-        conditions.append("rcept_dt <= %s")
-        params.append(_to_date_str(end_date))
-    if snapshot_date:
-        conditions.append("rcept_dt <= %s")
-        params.append(_to_date_str(snapshot_date))
-    if corp_name_filter:
-        conditions.append("corp_name = %s")
-        params.append(str(corp_name_filter).strip())
-
     if not include_periodic_status:
-        conditions.append("(source IS NULL OR source NOT LIKE %s)")
-        params.append("%OTRCPR_INVSTMNT_STTUS%")
+        conditions.append(
+            f"({alias}.source IS NULL OR ({alias}.source NOT LIKE %s AND {alias}.source NOT LIKE %s))"
+        )
+        params.extend(["%OTRCPR_INVSTMNT_STTUS%", "%OTCPR_STK_INH_DECSN%"])
+
     if not include_majorstock_status:
-        conditions.append("(source IS NULL OR source NOT LIKE %s)")
+        conditions.append(f"({alias}.source IS NULL OR {alias}.source NOT LIKE %s)")
         params.append("%MAJORSTOCK_STKQY_PROXY%")
 
+    if not conditions:
+        return "1=1", []
     return " AND ".join(conditions), params
 
 
-def _query_snapshot_dates(query: GraphQuery, settings: ServerSettings) -> list[str]:
-    corp_name_filter = str(query.search_stock).strip() if query.search_stock else None
-    where_sql, params = _build_base_where(
+def _safe_trimmed(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _resolve_search_corp_codes(
+    *,
+    search_stock: str,
+    query: GraphQuery,
+    settings: ServerSettings,
+    conn=None,
+) -> tuple[set[str], str | None]:
+    needle = _safe_trimmed(search_stock)
+    if not needle:
+        return set(), None
+    if re.fullmatch(r"\d{8}", needle):
+        return {needle}, needle
+
+    conditions = [
+        "d.corp_code IS NOT NULL",
+        "TRIM(d.corp_code) <> ''",
+        "d.corp_name IS NOT NULL",
+        "TRIM(d.corp_name) <> ''",
+        "d.rcept_dt IS NOT NULL",
+        "d.corp_name LIKE %s",
+    ]
+    params: list[object] = [f"%{needle}%"]
+
+    date_conds, date_params = _build_date_filters(
+        column_sql="d.rcept_dt",
         start_date=query.start_date,
         end_date=query.end_date,
-        snapshot_date=None,
-        corp_name_filter=corp_name_filter,
+    )
+    conditions.extend(date_conds)
+    params.extend(date_params)
+
+    sql = f"""
+    SELECT DISTINCT
+        TRIM(d.corp_code) AS corp_code,
+        TRIM(d.corp_name) AS corp_name
+    FROM {settings.db_disclosures_raw_table} d
+    WHERE {' AND '.join(conditions)}
+    ORDER BY d.rcept_dt DESC, d.rcept_no DESC
+    LIMIT 500
+    """
+
+    rows = _fetchall(sql, params, conn=conn)
+
+    if not rows:
+        return set(), None
+
+    q_lower = needle.lower()
+    q_norm = _norm_name(needle)
+    scored: list[tuple[float, str, str]] = []
+    for row in rows:
+        code = _safe_trimmed(row.get("corp_code"))
+        name = _safe_trimmed(row.get("corp_name"))
+        if not code or not name:
+            continue
+        n_lower = name.lower()
+        n_norm = _norm_name(name)
+        score = 0.0
+        if n_lower == q_lower:
+            score += 100.0
+        if q_norm and n_norm == q_norm:
+            score += 95.0
+        if q_lower and q_lower in n_lower:
+            score += 50.0
+        if q_norm and n_norm and q_norm in n_norm:
+            score += 45.0
+        score -= min(len(name), 200) * 0.01
+        scored.append((score, code, name))
+
+    if not scored:
+        return set(), None
+
+    best = max(x[0] for x in scored)
+    picked = [(c, n) for s, c, n in scored if s >= best - 2.0]
+    codes = {c for c, _ in picked if c}
+    if not codes:
+        return set(), None
+    label = sorted([n for _, n in picked if n], key=len)[0]
+    return codes, label
+
+
+def _query_snapshot_dates(
+    query: GraphQuery,
+    settings: ServerSettings,
+    *,
+    corp_codes: set[str] | None,
+    conn=None,
+) -> list[str]:
+    conditions = ["s.as_of_date IS NOT NULL"]
+    params: list[object] = []
+
+    date_conds, date_params = _build_date_filters(
+        column_sql="s.as_of_date",
+        start_date=query.start_date,
+        end_date=query.end_date,
+    )
+    conditions.extend(date_conds)
+    params.extend(date_params)
+
+    if corp_codes:
+        codes = sorted(corp_codes)
+        placeholders = ",".join(["%s"] * len(codes))
+        conditions.append(f"s.corp_code IN ({placeholders})")
+        params.extend(codes)
+
+    src_cond, src_params = _build_source_filter(
+        alias="l",
         include_periodic_status=query.include_periodic_status,
         include_majorstock_status=query.include_majorstock_status,
     )
-    sql = f"""
-    SELECT DISTINCT rcept_dt
-    FROM {settings.db_table}
-    WHERE {where_sql}
-    ORDER BY rcept_dt ASC
-    """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    if src_cond == "1=1":
+        sql = f"""
+        SELECT DISTINCT s.as_of_date
+        FROM {settings.db_edge_state_daily_table} s
+        WHERE {' AND '.join(conditions)}
+        ORDER BY s.as_of_date ASC
+        """
+        query_params = params
+    else:
+        sql = f"""
+        WITH eligible_lines AS (
+            SELECT DISTINCT l.rcept_no, l.corp_code
+            FROM {settings.db_investment_lines_raw_table} l
+            WHERE {src_cond}
+        )
+        SELECT DISTINCT s.as_of_date
+        FROM {settings.db_edge_state_daily_table} s
+        INNER JOIN eligible_lines el
+          ON el.rcept_no = s.last_rcept_no
+         AND el.corp_code = s.corp_code
+        WHERE {' AND '.join(conditions)}
+        ORDER BY s.as_of_date ASC
+        """
+        query_params = list(src_params) + params
+
+    rows = _fetchall(sql, query_params, conn=conn)
 
     out = []
     for row in rows:
-        dt = row.get("rcept_dt")
+        dt = row.get("as_of_date")
         if dt is None:
             continue
         out.append(str(pd.to_datetime(dt).date()))
     return out
-
-
-def _build_base_event_subquery(
-    query: GraphQuery,
-    settings: ServerSettings,
-    *,
-    snapshot_date: str,
-) -> tuple[str, list[object]]:
-    corp_name_filter = str(query.search_stock).strip() if query.search_stock else None
-    where_sql, params = _build_base_where(
-        start_date=query.start_date,
-        end_date=query.end_date,
-        snapshot_date=snapshot_date,
-        corp_name_filter=corp_name_filter,
-        include_periodic_status=query.include_periodic_status,
-        include_majorstock_status=query.include_majorstock_status,
-    )
-    if query.db_limit is not None and query.db_limit > 0:
-        sub_sql = f"""
-        SELECT
-            corp_name,
-            iscmp_cmpnm,
-            trfdtl_trfprc,
-            trfdtl_stkcnt,
-            report_nm,
-            trf_pp,
-            rcept_dt,
-            rcept_no
-        FROM {settings.db_table}
-        WHERE {where_sql}
-        ORDER BY rcept_dt ASC, rcept_no ASC
-        LIMIT %s
-        """
-        return sub_sql, params + [int(query.db_limit)]
-
-    sub_sql = f"""
-    SELECT
-        corp_name,
-        iscmp_cmpnm,
-        trfdtl_trfprc,
-        trfdtl_stkcnt,
-        report_nm,
-        trf_pp,
-        rcept_dt,
-        rcept_no
-    FROM {settings.db_table}
-    WHERE {where_sql}
-    """
-    return sub_sql, params
 
 
 def _query_aggregated_edges(
@@ -212,72 +303,149 @@ def _query_aggregated_edges(
     settings: ServerSettings,
     *,
     snapshot_date: str,
-    node_filter: set[str] | None = None,
+    corp_codes: set[str] | None = None,
+    pre_limit: int | None = None,
+    use_current_state: bool = False,
+    conn=None,
 ) -> pd.DataFrame:
-    sub_sql, sub_params = _build_base_event_subquery(query, settings, snapshot_date=snapshot_date)
-    where_extra = ""
-    params = list(sub_params)
-    if node_filter:
-        nodes = sorted(node_filter)
-        placeholders = ",".join(["%s"] * len(nodes))
-        where_extra = f"WHERE src IN ({placeholders}) AND dst IN ({placeholders})"
-        params.extend(nodes)
-        params.extend(nodes)
+    src_cond, src_params = _build_source_filter(
+        alias="l",
+        include_periodic_status=query.include_periodic_status,
+        include_majorstock_status=query.include_majorstock_status,
+    )
 
-    sql = f"""
-    SELECT
-        src,
-        dst,
-        SUM(weight_signed) AS net_weight,
-        ABS(SUM(weight_signed)) AS weight
+    conditions = [
+        "COALESCE(s.active_flag, 0) = 1",
+        "COALESCE(CAST(s.holding_shares AS DECIMAL(30,6)), 0) > 0",
+    ]
+    filter_params: list[object] = []
+    snapshot_date_sql = _to_date_str(snapshot_date)
+
+    if corp_codes:
+        codes = sorted(corp_codes)
+        placeholders = ",".join(["%s"] * len(codes))
+        conditions.append(f"s.corp_code IN ({placeholders})")
+        filter_params.extend(codes)
+
+    corp_name_sql = f"""
+    SELECT t.corp_code, t.corp_name
     FROM (
         SELECT
-            corp_name AS src,
-            iscmp_cmpnm AS dst,
-            (
-                -- magnitude from amount, fallback to stock-count when amount is missing
-                ABS(
-                    COALESCE(
-                        CAST(trfdtl_trfprc AS DECIMAL(30, 6)),
-                        CAST(trfdtl_stkcnt AS DECIMAL(30, 6)),
-                        0
-                    )
-                )
-                *
-                -- base direction: explicit sign first, otherwise infer from report name
-                CASE
-                    WHEN COALESCE(CAST(trfdtl_trfprc AS DECIMAL(30, 6)), CAST(trfdtl_stkcnt AS DECIMAL(30, 6)), 0) < 0 THEN -1
-                    WHEN COALESCE(CAST(trfdtl_trfprc AS DECIMAL(30, 6)), CAST(trfdtl_stkcnt AS DECIMAL(30, 6)), 0) > 0 THEN 1
-                    WHEN report_nm LIKE '%%처분%%' OR report_nm LIKE '%%양도%%' THEN -1
-                    ELSE 1
-                END
-                *
-                -- cancellation/withdrawal/cancelled-correction are treated as reversing events
-                CASE
-                    WHEN report_nm LIKE '%%취소%%'
-                      OR report_nm LIKE '%%철회%%'
-                      OR report_nm LIKE '%%중단%%'
-                      OR trf_pp LIKE '%%취소%%'
-                      OR trf_pp LIKE '%%철회%%'
-                      OR trf_pp LIKE '%%중단%%'
-                    THEN -1
-                    ELSE 1
-                END
-            ) AS weight_signed
-        FROM ({sub_sql}) base
-    ) e
-    {where_extra}
-    GROUP BY src, dst
-    HAVING ABS(SUM(weight_signed)) > 0
+            d.corp_code,
+            TRIM(d.corp_name) AS corp_name,
+            ROW_NUMBER() OVER (
+                PARTITION BY d.corp_code
+                ORDER BY d.rcept_dt DESC, d.rcept_no DESC
+            ) AS rn
+        FROM {settings.db_disclosures_raw_table} d
+        WHERE d.corp_code IS NOT NULL
+          AND d.rcept_dt IS NOT NULL
+          AND d.rcept_dt <= %s
+    ) t
+    WHERE t.rn = 1
     """
 
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    ctes: list[str] = []
+    if src_cond != "1=1":
+        ctes.append(
+            f"""
+            eligible_lines AS (
+                SELECT DISTINCT l.rcept_no, l.corp_code
+                FROM {settings.db_investment_lines_raw_table} l
+                WHERE {src_cond}
+            )
+            """
+        )
+    if use_current_state:
+        ctes.append(
+            f"""
+            state_src AS (
+                SELECT *
+                FROM {settings.db_edge_state_current_table}
+            )
+            """
+        )
+    else:
+        ctes.append(
+            f"""
+            state_src AS (
+                SELECT z.*
+                FROM (
+                    SELECT
+                        sd.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                sd.corp_code,
+                                COALESCE(sd.target_name_norm, ''),
+                                COALESCE(sd.investee_id, 0)
+                            ORDER BY
+                                sd.as_of_date DESC,
+                                COALESCE(sd.last_edge_event_id, 0) DESC
+                        ) AS rn
+                    FROM {settings.db_edge_state_daily_table} sd
+                    WHERE sd.as_of_date <= %s
+                ) z
+                WHERE z.rn = 1
+            )
+            """
+        )
+    ctes.append(
+        f"""
+        corp_latest AS (
+            {corp_name_sql}
+        )
+        """
+    )
+
+    base_from = "state_src s"
+    if src_cond != "1=1":
+        base_from += """
+    INNER JOIN eligible_lines el
+      ON el.rcept_no = s.last_rcept_no
+     AND el.corp_code = s.corp_code
+        """
+
+    sql = f"""
+    WITH {",".join(ctes)}
+    SELECT
+        COALESCE(NULLIF(TRIM(cl.corp_name), ''), s.corp_code) AS src,
+        COALESCE(
+            NULLIF(TRIM(i.name_canonical), ''),
+            NULLIF(TRIM(s.target_name_norm), ''),
+            CONCAT('investee:', COALESCE(CAST(s.investee_id AS CHAR), 'unknown'))
+        ) AS dst,
+        CAST(COALESCE(s.holding_shares, 0) AS DECIMAL(30,6)) AS net_weight,
+        CAST(
+            CASE
+                WHEN COALESCE(CAST(s.holding_shares AS DECIMAL(30,6)), 0) > 0
+                    THEN CASE
+                        WHEN COALESCE(CAST(s.holding_amount AS DECIMAL(30,6)), 0) > 0
+                            THEN CAST(s.holding_amount AS DECIMAL(30,6))
+                        ELSE CAST(s.holding_shares AS DECIMAL(30,6))
+                    END
+                ELSE 0
+            END
+            AS DECIMAL(30,6)
+        ) AS weight
+    FROM {base_from}
+    LEFT JOIN {settings.db_investee_dim_table} i
+      ON i.investee_id = s.investee_id
+    LEFT JOIN corp_latest cl
+      ON cl.corp_code = s.corp_code
+    WHERE {' AND '.join(conditions)}
+    """
+    query_params: list[object] = []
+    if src_cond != "1=1":
+        query_params.extend(src_params)
+    if not use_current_state:
+        query_params.append(snapshot_date_sql)
+    query_params.append(snapshot_date_sql)
+    query_params.extend(filter_params)
+    if pre_limit is not None and int(pre_limit) > 0:
+        sql += "\nORDER BY weight DESC\nLIMIT %s"
+        query_params.append(int(pre_limit))
+
+    rows = _fetchall(sql, query_params, conn=conn)
 
     edges = pd.DataFrame(rows)
     if edges.empty:
@@ -285,42 +453,189 @@ def _query_aggregated_edges(
     edges["src"] = edges["src"].astype(str)
     edges["dst"] = edges["dst"].astype(str)
     edges["weight"] = pd.to_numeric(edges["weight"], errors="coerce").fillna(0.0)
-    if "net_weight" in edges.columns:
-        edges["net_weight"] = pd.to_numeric(edges["net_weight"], errors="coerce").fillna(0.0)
+    edges["net_weight"] = pd.to_numeric(edges["net_weight"], errors="coerce").fillna(0.0)
+    edges = edges[edges["weight"] > 0].copy()
     return edges
 
 
-def _query_row_count(
+def _query_investing_history(
     query: GraphQuery,
     settings: ServerSettings,
     *,
     snapshot_date: str,
+    corp_codes: set[str] | None = None,
     node_filter: set[str] | None = None,
-) -> int:
-    sub_sql, sub_params = _build_base_event_subquery(query, settings, snapshot_date=snapshot_date)
-    params = list(sub_params)
-    where_extra = ""
-    if node_filter:
-        nodes = sorted(node_filter)
-        placeholders = ",".join(["%s"] * len(nodes))
-        where_extra = f"WHERE corp_name IN ({placeholders}) AND iscmp_cmpnm IN ({placeholders})"
-        params.extend(nodes)
-        params.extend(nodes)
+    limit: int = 500,
+    conn=None,
+) -> list[dict[str, object]]:
+    conditions = ["COALESCE(e.effective_dt, d.rcept_dt) IS NOT NULL"]
+    params: list[object] = []
+
+    date_conds, date_params = _build_date_filters(
+        column_sql="COALESCE(e.effective_dt, d.rcept_dt)",
+        start_date=query.start_date,
+        end_date=query.end_date,
+        snapshot_date=snapshot_date,
+    )
+    conditions.extend(date_conds)
+    params.extend(date_params)
+
+    if corp_codes:
+        codes = sorted(corp_codes)
+        placeholders = ",".join(["%s"] * len(codes))
+        conditions.append(f"e.corp_code IN ({placeholders})")
+        params.extend(codes)
+
+    src_cond, src_params = _build_source_filter(
+        alias="la",
+        include_periodic_status=query.include_periodic_status,
+        include_majorstock_status=query.include_majorstock_status,
+    )
 
     sql = f"""
-    SELECT COUNT(*) AS cnt
-    FROM ({sub_sql}) base
-    {where_extra}
+    WITH filtered_events AS (
+        SELECT
+            e.edge_event_id,
+            e.rcept_no,
+            e.corp_code,
+            e.corp_name,
+            e.investee_id,
+            e.target_name_norm,
+            e.reason_text,
+            e.delta_amount,
+            e.delta_shares,
+            e.event_effect_sign,
+            e.event_action,
+            d.rcept_dt,
+            d.report_nm,
+            d.viewer_url,
+            COALESCE(e.effective_dt, d.rcept_dt) AS sort_dt
+        FROM {settings.db_edge_events_table} e
+        LEFT JOIN {settings.db_disclosures_raw_table} d
+          ON d.rcept_no = e.rcept_no
+        WHERE {' AND '.join(conditions)}
+        ORDER BY
+            sort_dt DESC,
+            e.rcept_no DESC,
+            e.edge_event_id DESC
+        LIMIT %s
+    ),
+    targets AS (
+        SELECT DISTINCT
+            fe.rcept_no,
+            fe.corp_code,
+            COALESCE(NULLIF(TRIM(fe.target_name_norm), ''), '') AS target_name_norm
+        FROM filtered_events fe
+    ),
+    line_agg AS (
+        SELECT
+            l.rcept_no,
+            l.corp_code,
+            COALESCE(NULLIF(TRIM(l.iscmp_cmpnm_norm), ''), '') AS target_name_norm,
+            MAX(NULLIF(TRIM(l.iscmp_cmpnm_raw), '')) AS iscmp_cmpnm_raw,
+            MAX(l.source) AS source,
+            MAX(l.viewer_url) AS viewer_url,
+            MAX(l.trf_pp) AS trf_pp,
+            MAX(l.trfdtl_trfprc) AS trfdtl_trfprc,
+            MAX(l.trfdtl_stkcnt) AS trfdtl_stkcnt
+        FROM {settings.db_investment_lines_raw_table} l
+        INNER JOIN targets t
+          ON t.rcept_no = l.rcept_no
+         AND t.corp_code = l.corp_code
+         AND t.target_name_norm = COALESCE(NULLIF(TRIM(l.iscmp_cmpnm_norm), ''), '')
+        GROUP BY
+            l.rcept_no,
+            l.corp_code,
+            COALESCE(NULLIF(TRIM(l.iscmp_cmpnm_norm), ''), '')
+    )
+    SELECT
+        fe.rcept_dt,
+        fe.rcept_no,
+        COALESCE(NULLIF(TRIM(fe.corp_name), ''), fe.corp_code) AS corp_name,
+        COALESCE(
+            NULLIF(TRIM(la.iscmp_cmpnm_raw), ''),
+            NULLIF(TRIM(i.name_canonical), ''),
+            NULLIF(TRIM(fe.target_name_norm), ''),
+            ''
+        ) AS iscmp_cmpnm,
+        COALESCE(fe.report_nm, '') AS report_nm,
+        COALESCE(la.trf_pp, fe.reason_text, '') AS trf_pp,
+        COALESCE(la.source, '') AS source,
+        COALESCE(la.viewer_url, fe.viewer_url, '') AS viewer_url,
+        COALESCE(la.trfdtl_trfprc, fe.delta_amount) AS trfdtl_trfprc,
+        COALESCE(la.trfdtl_stkcnt, fe.delta_shares) AS trfdtl_stkcnt,
+        fe.event_effect_sign,
+        fe.event_action
+    FROM filtered_events fe
+    LEFT JOIN line_agg la
+      ON la.rcept_no = fe.rcept_no
+     AND la.corp_code = fe.corp_code
+     AND la.target_name_norm = COALESCE(NULLIF(TRIM(fe.target_name_norm), ''), '')
+    LEFT JOIN {settings.db_investee_dim_table} i
+      ON i.investee_id = fe.investee_id
+    WHERE {src_cond}
+    ORDER BY
+        fe.sort_dt DESC,
+        fe.rcept_no DESC,
+        fe.edge_event_id DESC
     """
+    query_params = list(params)
+    query_params.append(max(int(limit), 1))
+    if src_cond != "1=1":
+        query_params.extend(src_params)
 
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            row = cur.fetchone() or {"cnt": 0}
-    finally:
-        conn.close()
-    return int(row.get("cnt", 0) or 0)
+    rows = _fetchall(sql, query_params, conn=conn)
+
+    out: list[dict[str, object]] = []
+    for row in rows or []:
+        corp_name = _safe_trimmed(row.get("corp_name"))
+        cmp_name = _safe_trimmed(row.get("iscmp_cmpnm"))
+        if cmp_name in {",", "및", "-", "nan", "None", "null", "NULL"}:
+            cmp_name = ""
+
+        if node_filter:
+            if _norm_name(corp_name) not in node_filter:
+                continue
+            if _norm_name(cmp_name) not in node_filter:
+                continue
+
+        amt = pd.to_numeric(row.get("trfdtl_trfprc"), errors="coerce")
+        stk = pd.to_numeric(row.get("trfdtl_stkcnt"), errors="coerce")
+        sign_num = pd.to_numeric(row.get("event_effect_sign"), errors="coerce")
+        action = _safe_trimmed(row.get("event_action")).upper()
+        if pd.notna(sign_num) and float(sign_num) < 0:
+            direction = "OUT"
+        elif pd.notna(sign_num) and float(sign_num) > 0:
+            direction = "IN"
+        elif action in {"DISPOSE", "PLAN_DISPOSE", "CLOSE", "CANCEL_EXECUTED", "CANCEL_PLAN"}:
+            direction = "OUT"
+        else:
+            direction = "IN"
+
+        rcept_no = _safe_trimmed(row.get("rcept_no"))
+        viewer_url = _safe_trimmed(row.get("viewer_url"))
+        if not viewer_url and rcept_no:
+            viewer_url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
+
+        dt = row.get("rcept_dt")
+        dt_str = None if dt is None else str(pd.to_datetime(dt).date())
+
+        out.append(
+            {
+                "rcept_dt": dt_str,
+                "rcept_no": rcept_no,
+                "corp_name": corp_name,
+                "iscmp_cmpnm": cmp_name,
+                "report_nm": _safe_trimmed(row.get("report_nm")),
+                "trf_pp": _safe_trimmed(row.get("trf_pp")),
+                "source": _safe_trimmed(row.get("source")),
+                "viewer_url": viewer_url,
+                "trfdtl_trfprc": None if pd.isna(amt) else float(amt),
+                "trfdtl_stkcnt": None if pd.isna(stk) else float(stk),
+                "event_direction": direction,
+            }
+        )
+    return out
 
 
 def _resolve_highlight_node(all_nodes: list[str], query: str | None) -> str | None:
@@ -539,136 +854,201 @@ def _build_figure_json(
 
 
 def build_graph_response(query: GraphQuery, settings: ServerSettings) -> GraphResponse:
-    selected_corp = str(query.search_stock).strip() if query.search_stock else None
-
+    selected_query = _safe_trimmed(query.search_stock) or None
     effective_max_edges = max(1, min(int(query.max_edges), SYSTEM_MAX_EDGES))
+
+    table_sig = (
+        settings.db_disclosures_raw_table,
+        settings.db_edge_state_daily_table,
+        settings.db_edge_events_table,
+        settings.db_investment_lines_raw_table,
+        settings.db_investee_dim_table,
+    )
     cache_key = (
-        settings.db_table,
+        table_sig,
         query.start_date,
         query.end_date,
         query.snapshot_date,
-        query.search_stock,
+        selected_query,
         int(query.highlight_hops),
         effective_max_edges,
         query.db_limit,
+        int(query.history_limit),
         bool(query.include_periodic_status),
         bool(query.include_majorstock_status),
+        bool(query.include_figure),
+        bool(query.include_history),
+        bool(query.include_top_edges),
     )
     cached = _GRAPH_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    snapshot_dates = _query_snapshot_dates(query, settings)
-    if not snapshot_dates:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(title="No data in selected range", height=850)
-        status_text = "No data in selected range."
-        if selected_corp:
-            status_text = f"'{selected_corp}' 종목 데이터가 선택된 기간에 없습니다."
-        response = GraphResponse(
-            snapshot_dates=[],
-            snapshot_date=None,
-            selected_stock=selected_corp,
-            rows=0,
-            edges_shown=0,
-            status_text=status_text,
-            figure=json.loads(empty_fig.to_json()),
-            top_edges=[],
+    pre_limit = int(query.db_limit) if query.db_limit else max(effective_max_edges * 80, 5000)
+
+    conn = get_connection()
+    try:
+        corp_codes: set[str] | None = None
+        resolved_name: str | None = None
+        if selected_query:
+            corp_codes, resolved_name = _resolve_search_corp_codes(
+                search_stock=selected_query,
+                query=query,
+                settings=settings,
+                conn=conn,
+            )
+            if not corp_codes:
+                response = GraphResponse(
+                    snapshot_dates=[],
+                    snapshot_date=None,
+                    selected_stock=selected_query,
+                    rows=0,
+                    edges_shown=0,
+                    status_text=f"search_stock '{selected_query}' not found in corp_name",
+                    figure=_empty_figure("No data in selected range", include_figure=query.include_figure),
+                    nodes=[],
+                    edges=[],
+                    top_edges=[],
+                    investing_history=[],
+                )
+                _GRAPH_CACHE.set(cache_key, response)
+                return response
+
+        snapshot_dates = _query_snapshot_dates(
+            query=query,
+            settings=settings,
+            corp_codes=corp_codes,
+            conn=conn,
         )
-        _GRAPH_CACHE.set(cache_key, response)
-        return response
+        if not snapshot_dates:
+            response = GraphResponse(
+                snapshot_dates=[],
+                snapshot_date=None,
+                selected_stock=resolved_name or selected_query,
+                rows=0,
+                edges_shown=0,
+                status_text="No data in selected range.",
+                figure=_empty_figure("No data in selected range", include_figure=query.include_figure),
+                nodes=[],
+                edges=[],
+                top_edges=[],
+                investing_history=[],
+            )
+            _GRAPH_CACHE.set(cache_key, response)
+            return response
 
-    snapshot_date = snapshot_dates[-1]
-    if query.snapshot_date:
-        req = pd.to_datetime(query.snapshot_date, errors="coerce")
-        if pd.isna(req):
-            raise ValueError(f"Invalid snapshot_date: {query.snapshot_date}")
-        req_date = req.date()
-        candidates = [pd.to_datetime(d).date() for d in snapshot_dates if pd.to_datetime(d).date() <= req_date]
-        snapshot_date = candidates[-1] if candidates else snapshot_dates[0]
-    snapshot_date = str(snapshot_date)
+        snapshot_date = snapshot_dates[-1]
+        if query.snapshot_date:
+            req = pd.to_datetime(query.snapshot_date, errors="coerce")
+            if pd.isna(req):
+                raise ValueError(f"Invalid snapshot_date: {query.snapshot_date}")
+            req_date = req.date()
+            candidates = [pd.to_datetime(d).date() for d in snapshot_dates if pd.to_datetime(d).date() <= req_date]
+            snapshot_date = candidates[-1] if candidates else pd.to_datetime(snapshot_dates[0]).date()
+        snapshot_date = str(snapshot_date)
+        use_current_state = bool(snapshot_dates) and snapshot_date == str(snapshot_dates[-1])
 
-    all_edges = _query_aggregated_edges(
-        query=query,
-        settings=settings,
-        snapshot_date=snapshot_date,
-        node_filter=None,
-    )
-    if all_edges.empty:
-        empty_fig = go.Figure()
-        empty_fig.update_layout(title="No data in selected range", height=850)
-        response = GraphResponse(
-            snapshot_dates=snapshot_dates,
+        all_edges = _query_aggregated_edges(
+            query=query,
+            settings=settings,
             snapshot_date=snapshot_date,
-            selected_stock=None,
-            rows=0,
-            edges_shown=0,
-            status_text="No data in selected range.",
-            figure=json.loads(empty_fig.to_json()),
-            top_edges=[],
+            corp_codes=corp_codes,
+            pre_limit=pre_limit,
+            use_current_state=use_current_state,
+            conn=conn,
         )
-        _GRAPH_CACHE.set(cache_key, response)
-        return response
+        if all_edges.empty:
+            response = GraphResponse(
+                snapshot_dates=[str(x) for x in snapshot_dates],
+                snapshot_date=snapshot_date,
+                selected_stock=resolved_name or selected_query,
+                rows=0,
+                edges_shown=0,
+                status_text="No active holding edges in selected snapshot.",
+                figure=_empty_figure("No active holding edges", include_figure=query.include_figure),
+                nodes=[],
+                edges=[],
+                top_edges=[],
+                investing_history=[],
+            )
+            _GRAPH_CACHE.set(cache_key, response)
+            return response
 
-    all_nodes = sorted(set(all_edges["src"]).union(set(all_edges["dst"])))
-    selected = selected_corp if selected_corp else _resolve_highlight_node(all_nodes, query.search_stock)
-    keep_nodes: set[str] | None = None
+        all_nodes = sorted(set(all_edges["src"]).union(set(all_edges["dst"])))
+        selected = _resolve_highlight_node(all_nodes, resolved_name or selected_query)
+        keep_nodes: set[str] | None = None
+        keep_nodes_norm: set[str] | None = None
+        if selected and not selected_query:
+            keep_nodes = _k_hop_nodes_from_edges(all_edges, selected, query.highlight_hops)
+            keep_nodes_norm = {_norm_name(x) for x in keep_nodes}
+            if keep_nodes:
+                all_edges = all_edges[
+                    all_edges["src"].isin(keep_nodes) & all_edges["dst"].isin(keep_nodes)
+                ].copy()
 
-    if selected and not selected_corp:
-        keep_nodes = _k_hop_nodes_from_edges(all_edges, selected, query.highlight_hops)
-        if keep_nodes:
-            all_edges = all_edges[
-                all_edges["src"].isin(keep_nodes) & all_edges["dst"].isin(keep_nodes)
-            ].copy()
+        rows_count = int(len(all_edges))
+        edges = _aggregate_edges(all_edges, max_edges=effective_max_edges, pinned_node=selected)
+        history_rows: list[dict[str, object]] = []
+        if query.include_history:
+            history_rows = _query_investing_history(
+                query=query,
+                settings=settings,
+                snapshot_date=snapshot_date,
+                corp_codes=corp_codes,
+                node_filter=keep_nodes_norm if selected else None,
+                limit=query.history_limit,
+                conn=conn,
+            )
+    finally:
+        conn.close()
 
-    edges = _aggregate_edges(all_edges, max_edges=effective_max_edges, pinned_node=selected)
-    rows_count = _query_row_count(
-        query=query,
-        settings=settings,
-        snapshot_date=snapshot_date,
-        node_filter=keep_nodes if selected else None,
-    )
     reporting_set = set(edges["src"].astype(str).unique()) if not edges.empty else set()
-    title = f"Stock Relationship 3D Network (Net-Adjusted) | As-Of Snapshot Date: {snapshot_date}"
+    title = f"Stock Relationship 3D Network (State Snapshot) | As-Of Snapshot Date: {snapshot_date}"
     if selected:
         title += f" | Highlight: {selected} (hop <= {query.highlight_hops})"
 
-    figure = _build_figure_json(
-        edges=edges,
-        reporting_set=reporting_set,
-        selected=selected,
-        highlight_hops=query.highlight_hops,
-        title=title,
-    )
-
-    if query.search_stock and not selected:
-        status = (
-            f"As-Of Snapshot Date: {snapshot_date} | Rows: {rows_count:,} | "
-            f"Edges shown: {len(edges):,} | net-adjusted (dispose/cancel reflected) | "
-            f"stock search '{query.search_stock}' not found"
+    if query.include_figure:
+        figure = _build_figure_json(
+            edges=edges,
+            reporting_set=reporting_set,
+            selected=selected,
+            highlight_hops=query.highlight_hops,
+            title=title,
         )
     else:
-        status = (
-            f"As-Of Snapshot Date: {snapshot_date} | Rows: {rows_count:,} | "
-            f"Edges shown: {len(edges):,} | net-adjusted (dispose/cancel reflected)"
-            + (f" | Highlight: {selected}" if selected else "")
-        )
+        figure = _empty_figure(title, include_figure=False, height=900)
 
-    top = edges.sort_values("weight", ascending=False).head(20).copy()
-    top_edges = [
+    status = (
+        f"As-Of Snapshot Date: {snapshot_date} | Rows: {rows_count:,} | "
+        f"Edges shown: {len(edges):,} | active holding only"
+        + (f" | Highlight: {selected}" if selected else "")
+    )
+
+    edge_rows = [
         TopEdge(src=str(r["src"]), dst=str(r["dst"]), weight=float(r["weight"]))
-        for _, r in top.iterrows()
+        for _, r in edges.iterrows()
     ]
+    top_edges: list[TopEdge] = []
+    if query.include_top_edges:
+        top = edges.sort_values("weight", ascending=False).head(20).copy()
+        top_edges = [
+            TopEdge(src=str(r["src"]), dst=str(r["dst"]), weight=float(r["weight"]))
+            for _, r in top.iterrows()
+        ]
+    node_rows = sorted(set(edges["src"].astype(str)).union(set(edges["dst"].astype(str))))
 
     response = GraphResponse(
         snapshot_dates=[str(x) for x in snapshot_dates],
         snapshot_date=snapshot_date,
-        selected_stock=selected,
-        rows=int(rows_count),
+        selected_stock=selected or resolved_name or selected_query,
+        rows=rows_count,
         edges_shown=int(len(edges)),
         status_text=status,
         figure=figure,
+        nodes=node_rows,
+        edges=edge_rows,
         top_edges=top_edges,
+        investing_history=history_rows,
     )
     _GRAPH_CACHE.set(cache_key, response)
     return response
@@ -683,9 +1063,15 @@ def list_stock_options(
     include_periodic_status: bool,
     include_majorstock_status: bool,
     settings: ServerSettings,
+    conn=None,
 ) -> list[str]:
+    table_sig = (
+        settings.db_disclosures_raw_table,
+        settings.db_investment_lines_raw_table,
+        settings.db_edge_events_table,
+    )
     cache_key = (
-        settings.db_table,
+        table_sig,
         start_date,
         end_date,
         q or "",
@@ -697,48 +1083,69 @@ def list_stock_options(
     if cached is not None:
         return cached
 
-    where_sql, params = _build_base_where(
+    conditions = [
+        "d.rcept_dt IS NOT NULL",
+        "d.corp_name IS NOT NULL",
+        "TRIM(d.corp_name) <> ''",
+        "TRIM(d.corp_name) <> '-'",
+        "TRIM(d.corp_name) <> 'nan'",
+        "TRIM(d.corp_name) <> 'None'",
+        "TRIM(d.corp_code) <> ''",
+        (
+            "EXISTS ("
+            f"SELECT 1 FROM {settings.db_edge_events_table} e "
+            "WHERE e.rcept_no = d.rcept_no AND e.corp_code = d.corp_code"
+            ")"
+        ),
+    ]
+    params: list[object] = []
+
+    date_conds, date_params = _build_date_filters(
+        column_sql="d.rcept_dt",
         start_date=start_date,
         end_date=end_date,
         snapshot_date=None,
-        corp_name_filter=None,
+    )
+    conditions.extend(date_conds)
+    params.extend(date_params)
+
+    if q and q.strip():
+        conditions.append("d.corp_name LIKE %s")
+        params.append(f"%{q.strip()}%")
+
+    src_cond, src_params = _build_source_filter(
+        alias="l",
         include_periodic_status=include_periodic_status,
         include_majorstock_status=include_majorstock_status,
     )
+    if src_cond == "1=1":
+        sql = f"""
+        SELECT DISTINCT TRIM(d.corp_name) AS name
+        FROM {settings.db_disclosures_raw_table} d
+        WHERE {' AND '.join(conditions)}
+        ORDER BY name ASC
+        LIMIT %s
+        """
+        query_params = list(params) + [max(int(limit) * 4, int(limit), 1)]
+    else:
+        sql = f"""
+        WITH eligible_lines AS (
+            SELECT DISTINCT l.rcept_no, l.corp_code
+            FROM {settings.db_investment_lines_raw_table} l
+            WHERE {src_cond}
+        )
+        SELECT DISTINCT TRIM(d.corp_name) AS name
+        FROM {settings.db_disclosures_raw_table} d
+        INNER JOIN eligible_lines el
+          ON el.rcept_no = d.rcept_no
+         AND el.corp_code = d.corp_code
+        WHERE {' AND '.join(conditions)}
+        ORDER BY name ASC
+        LIMIT %s
+        """
+        query_params = list(src_params) + list(params) + [max(int(limit) * 4, int(limit), 1)]
 
-    extra = ""
-    if q and q.strip():
-        extra = " AND corp_name LIKE %s"
-        params.append(f"%{q.strip()}%")
-
-    sql = f"""
-    SELECT DISTINCT TRIM(corp_name) AS name
-    FROM {settings.db_table}
-    WHERE {where_sql} {extra}
-      AND corp_name IS NOT NULL
-      AND TRIM(corp_name) <> ''
-      AND TRIM(corp_name) <> '-'
-      AND TRIM(corp_name) <> 'nan'
-      AND TRIM(corp_name) <> 'None'
-    """
-
-    sql = f"""
-    SELECT name FROM (
-    {sql}
-    ) u
-    WHERE name IS NOT NULL AND name <> ''
-    ORDER BY name ASC
-    LIMIT %s
-    """
-    query_params = list(params) + [max(int(limit) * 4, int(limit), 1)]
-
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(query_params))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    rows = _fetchall(sql, query_params, conn=conn)
 
     nodes = [str(r.get("name", "")).strip() for r in rows if str(r.get("name", "")).strip()]
     if q and q.strip():

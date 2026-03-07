@@ -30,7 +30,7 @@ VIEWER_URL = "https://dart.fss.or.kr/report/viewer.do"
 TRANSFER_TITLE_REGEX = r"타법인\s*주식\s*및\s*출자증권\s*(?:처분결정|양도결정|취득결정|양수결정)"
 
 VIEWDOC_PATTERN = re.compile(
-    r"viewDoc\(\s*['\"](?P<rcpNo>\d{14})['\"]\s*,\s*['\"](?P<dcmNo>\d+)['\"]\s*,\s*['\"](?P<eleId>\d+)['\"]\s*,\s*['\"](?P<offset>\d+)['\"]\s*,\s*['\"](?P<length>\d+)['\"]\s*,\s*['\"](?P<dtd>[^'\"]+)['\"]\s*\)",
+    r"viewDoc\(\s*['\"](?P<rcpNo>\d{14})['\"]\s*,\s*['\"](?P<dcmNo>\d+)['\"]\s*,\s*['\"](?P<eleId>\d+)['\"]\s*,\s*['\"](?P<offset>\d+)['\"]\s*,\s*['\"](?P<length>\d+)['\"]\s*,\s*['\"](?P<dtd>[^'\"]+)['\"](?:\s*,\s*['\"][^'\"]*['\"])?\s*\)",
     re.IGNORECASE,
 )
 
@@ -392,7 +392,11 @@ def _extract_fields_from_html_text(html_text: str) -> Dict[str, Any]:
         if val is None:
             val = _pick_value_from_lines(lines, aliases)
         if val is not None and str(val).strip() != "":
-            out[field] = str(val).strip()
+            vv = str(val).strip()
+            if field == "iscmp_cmpnm" and _is_bad_issuer(vv):
+                out[field] = pd.NA
+            else:
+                out[field] = vv
 
     for c in LEGACY_NUM_COLS:
         out[c] = _num_or_na(out.get(c))
@@ -435,6 +439,7 @@ def _fetch_viewer_html_by_rcpno(
     session: requests.Session,
     timeout: int = 30,
     request_interval_sec: float = 0.0,
+    out_meta: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], str]:
     main_resp = _throttled_session_get(
         session,
@@ -445,6 +450,8 @@ def _fetch_viewer_html_by_rcpno(
     )
     main_resp.raise_for_status()
     main_html = main_resp.text
+    if out_meta is not None:
+        out_meta["main_html"] = main_html
 
     cands = _find_viewdoc_candidates(main_html)
     best = _choose_best_candidate(cands)
@@ -504,7 +511,23 @@ _LABEL_TO_FIELD_N = {_norm_label(k): v for k, v in _LABEL_TO_FIELD.items()}
 
 
 def _to_field(label: str) -> Optional[str]:
-    return _LABEL_TO_FIELD_N.get(_norm_label(label))
+    n = _norm_label(label)
+    hit = _LABEL_TO_FIELD_N.get(n)
+    if hit:
+        return hit
+
+    # fuzzy fallback for variants like "처분내역처분금액(원)(A)" / "처분내역처분주식수(주)"
+    if ("주식수" in n) and any(k in n for k in ("처분", "양도", "취득", "양수")):
+        return "trfdtl_stkcnt"
+    if ("금액" in n) and any(k in n for k in ("처분", "양도", "취득", "양수")):
+        return "trfdtl_trfprc"
+    if ("목적" in n) and any(k in n for k in ("처분", "양도", "취득", "양수")):
+        return "trf_pp"
+    if ("예정일자" in n) and any(k in n for k in ("처분", "양도", "취득", "양수")):
+        return "trf_prd"
+    if "이사회결의일" in n or "결정일" in n:
+        return "bddd"
+    return None
 
 
 def _extract_fields_from_xml_tags(xml_text: str) -> Dict[str, Any]:
@@ -545,6 +568,14 @@ def _extract_fields_from_xml_tags(xml_text: str) -> Dict[str, Any]:
         "trfdtl_ecpt", "attrf_owstkcnt", "attrf_eqrt",
     ]:
         out[c] = _num_or_na_keep_sign(out.get(c))
+    if _is_bad_issuer(out.get("iscmp_cmpnm")):
+        out["iscmp_cmpnm"] = pd.NA
+
+    combo_text = soup.get_text("\n", strip=True)
+    num_fallback = _extract_amount_qty_from_text(combo_text)
+    for k in ("trfdtl_trfprc", "trfdtl_stkcnt"):
+        if pd.isna(out.get(k)) and (k in num_fallback):
+            out[k] = num_fallback[k]
     out["trf_prd"] = _norm_date_any(out.get("trf_prd"))
     out["bddd"] = _norm_date_any(out.get("bddd"))
     return out
@@ -608,7 +639,219 @@ def _is_bad_issuer(x: Any) -> bool:
     if _is_empty_like(x):
         return True
     s = str(x).strip()
-    return s in {"회사명", "회사명(국적)", "발행회사", "1. 발행회사"}
+    if not s:
+        return True
+    compact = re.sub(r"\s+", "", s)
+    compact = (
+        compact.replace("（", "(")
+        .replace("）", ")")
+        .replace("［", "[")
+        .replace("］", "]")
+        .replace("｛", "{")
+        .replace("｝", "}")
+    )
+    core = re.sub(r"^[\(\[\{<]+|[\)\]\}>]+$", "", compact)
+    compact_plain = re.sub(r"[^0-9A-Za-z가-힣]", "", compact)
+    core_plain = re.sub(r"[^0-9A-Za-z가-힣]", "", core)
+    bad_tokens = {
+        "회사명",
+        "회사명(국적)",
+        "회사명국적",
+        "발행회사",
+        "발행주식총수",
+        "발행주식총수(주)",
+        "발행주식총수주",
+        "1.발행회사",
+        "대표자",
+        "대표이사",
+        "대표자명",
+        "대표이사명",
+        "(대표자)",
+        "(대표이사)",
+        "국적",
+        "(국적)",
+        "자본금",
+        "자본금(원)",
+        "자본금원",
+        "금액",
+        "금액(원)",
+        "금액(백만원)",
+        "취득금액",
+        "취득금액(원)",
+        "처분금액",
+        "처분금액(원)",
+        "양수금액",
+        "양수금액(원)",
+        "양도금액",
+        "양도금액(원)",
+        "주식수",
+        "주식수(주)",
+        "취득주식수",
+        "취득주식수(주)",
+        "처분주식수",
+        "처분주식수(주)",
+        "양수주식수",
+        "양수주식수(주)",
+        "양도주식수",
+        "양도주식수(주)",
+        "출자사재무제표",
+        "발행회사의요약재무상황",
+        "철회사유",
+        "제출사유",
+        "주요내용",
+        "관계",
+        "(관계)",
+        "회사와관계",
+        "(회사와관계)",
+        ",",
+        ".",
+        "및",
+        "와",
+        "과",
+        "-",
+    }
+    if compact in bad_tokens:
+        return True
+    if re.fullmatch(r"[-,./|&]+", compact):
+        return True
+    if re.fullmatch(r"\d[\d,]*(?:\.\d+)?", compact):
+        return True
+    if compact_plain in {
+        "회사명",
+        "회사명국적",
+        "발행회사",
+        "발행주식총수",
+        "발행주식총수주",
+        "대표자",
+        "대표이사",
+        "대표자명",
+        "대표이사명",
+        "국적",
+        "성명",
+        "관계",
+        "회사와관계",
+        "자본금",
+        "자본금원",
+    }:
+        return True
+    if compact_plain in {"및", "와", "과"}:
+        return True
+    if any(
+        t in compact_plain
+        for t in {
+            "사명정정",
+            "대표조합원변경",
+            "기재누락",
+            "기재오류",
+            "기재정정",
+            "정정사항",
+            "정정내용",
+            "기타투자판단과관련한중요사항",
+            "투자판단과관련한중요사항",
+            "기재내용추가",
+            "양도예정일자",
+            "취득예정일자",
+            "변경전",
+            "변경후",
+        }
+    ):
+        return True
+    if (
+        "회사명" in compact_plain
+        and any(t in compact_plain for t in {"국적", "대표자", "대표이사", "자본금", "발행주식총수", "주요사업"})
+    ):
+        return True
+    if "철회사유" in compact_plain:
+        return True
+    if compact_plain in {"제출사유", "주요내용"}:
+        return True
+    if compact_plain in {"대한민국", "한국", "중국", "미국", "일본", "영국", "독일", "프랑스", "체코", "홍콩", "대만"}:
+        return True
+    if "단위" in compact_plain:
+        return True
+    if ("금액" in compact_plain) and ("회사명" not in compact_plain):
+        return True
+    if "주식수" in compact_plain:
+        return True
+    if ("억원" in compact_plain) or ("백만원" in compact_plain):
+        return True
+    if any(
+        t in compact_plain
+        for t in {
+            "상기사항",
+            "기준환율",
+            "정정전",
+            "정정후",
+        "출자할예정",
+        "취득금액은",
+        "처분금액은",
+        "발행회사의요약재무상황",
+        "출자사재무제표",
+        "철회사유",
+        }
+    ):
+        return True
+    if re.fullmatch(r"(?:취득|처분|양수|양도)?금액(?:원|백만원)?", compact_plain):
+        return True
+    if re.fullmatch(r"(?:취득|처분|양수|양도)?주식수(?:주)?", compact_plain):
+        return True
+    if compact_plain.endswith("재무제표"):
+        return True
+    amount_hits = re.findall(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", s)
+    if amount_hits:
+        # Avoid taking note/body fragments or representative+capital tuples as issuer.
+        if re.match(r"^\s*[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", s):
+            return True
+        if re.search(r"\s[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$", s):
+            return True
+        if len(amount_hits) >= 2:
+            return True
+    if core_plain in {"대표자", "대표이사", "대표자명", "대표이사명", "국적", "관계", "회사와관계"}:
+        return True
+    if not re.search(r"[A-Za-z가-힣]", compact_plain):
+        return True
+    if re.fullmatch(r"\((대표자|대표이사|국적|관계|회사와관계)\)", compact):
+        return True
+    if re.fullmatch(r"(대표자|대표이사)(명)?", compact_plain):
+        return True
+    # role-tail noise such as: "주식회사 ○○ 대 표 이 사"
+    if any(t in compact_plain for t in {"대표이사", "대표자"}) and (len(compact_plain) > 8):
+        return True
+    return False
+
+
+def _extract_amount_qty_from_text(raw_text: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if not raw_text:
+        return out
+
+    txt = re.sub(r"\s+", " ", str(raw_text))
+
+    amount_patterns = [
+        r"(?:처분|양도|취득|양수)(?:내역)?\s*(?:처분|양도|취득|양수)?금액(?:\s*\(?원\)?(?:\s*\([A-Z]\))?)?\s*[:：]?\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+        r"거래금액\s*\(?원\)?\s*[:：]?\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+    ]
+    qty_patterns = [
+        r"(?:처분|양도|취득|양수)(?:내역)?\s*(?:처분|양도|취득|양수)?주식수\s*\(?주\)?\s*[:：]?\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+    ]
+
+    for pat in amount_patterns:
+        m = re.search(pat, txt, flags=re.I)
+        if m:
+            v = _num_or_na_keep_sign(m.group(1))
+            if not pd.isna(v):
+                out["trfdtl_trfprc"] = v
+                break
+
+    for pat in qty_patterns:
+        m = re.search(pat, txt, flags=re.I)
+        if m:
+            v = _num_or_na_keep_sign(m.group(1))
+            if not pd.isna(v):
+                out["trfdtl_stkcnt"] = v
+                break
+
+    return out
 
 
 def _extract_submitter_from_title(viewer_html: str) -> Any:
@@ -642,12 +885,13 @@ def _extract_issuer_from_viewer_table(markup: str) -> Any:
     patterns = [
         r"회사명\(국적\)\s*([^\n]{2,120}?)\s*(?:대표이사|자본금\(원\)|자본금)",
         r"회사명\s*([^\n]{2,120}?)\s*(?:국적|대표자|대표이사|자본금\(원\)|자본금)",
+        r"(?:\*?\s*)?(?:회사명(?:\(국적\))?|발행회사(?:\(회사명\))?)\s*[:：]\s*([^\n]{2,220}?)(?=\s*(?:\*?\s*)?(?:국적|대표자|대표이사|자본금(?:\(원\))?|발행주식총수(?:\(주\))?|주요사업)\s*[:：]|$)",
     ]
     for pat in patterns:
         m = re.search(pat, plain, flags=re.I | re.S)
         if not m:
             continue
-        v = re.sub(r"\s+", " ", m.group(1)).strip(" \t:-")
+        v = _normalize_company_token(m.group(1))
         if not _is_bad_issuer(v):
             return v
     return pd.NA
@@ -660,12 +904,31 @@ def _extract_issuer_from_text(raw_text: str) -> Any:
     patterns = [
         r"회사명\(국적\)\s*([가-힣A-Za-z0-9\(\)\.\-·&\s]{2,120}?)\s*(?:대표이사|대표자|자본금\(원\)|자본금)",
         r"회사명\s*([가-힣A-Za-z0-9\(\)\.\-·&㈜\s]{2,120}?)\s*(?:국적|대표자|대표이사|자본금\(원\)|자본금)",
+        r"(?:\*?\s*)?(?:회사명(?:\(국적\))?|발행회사(?:\(회사명\))?)\s*[:：]\s*([가-힣A-Za-z0-9\(\)\.\-·&㈜,\s]{2,220}?)(?=\s*(?:\*?\s*)?(?:국적|대표자|대표이사|자본금(?:\(원\))?|발행주식총수(?:\(주\))?|주요사업)\s*[:：]|$)",
     ]
     for pat in patterns:
         m = re.search(pat, txt, flags=re.I | re.S)
         if not m:
             continue
-        v = re.sub(r"\s+", " ", m.group(1)).strip(" \t:-")
+        v = _normalize_company_token(m.group(1))
+        if not _is_bad_issuer(v):
+            return v
+
+    # narrative fallback for correction reports:
+    # "회사가 소유하고 있는 <회사명> 주식 ..."
+    narrative_patterns = [
+        r"소유하고\s*있는\s*([A-Za-z0-9가-힣&\.\-,'\(\)\s]{2,180}?)\s*\(이하",
+        r"소유하고\s*있는\s*([A-Za-z0-9가-힣&\.\-,'\(\)\s]{2,180}?)\s*주식\s*\d",
+        r"(\(주\)\s*[A-Za-z0-9가-힣&\.\-]{2,180}(?:회사|리츠|투자회사|위탁관리부동산투자회사)?)\s*가\s*유상증자로\s*발행할\s*주식",
+        r"(주식회사\s*[A-Za-z0-9가-힣&\.\-\s]{2,180})\s*가\s*유상증자로\s*발행할\s*주식",
+        r"(\(주\)\s*[A-Za-z0-9가-힣&\.\-]{2,180}(?:회사|리츠|투자회사|위탁관리부동산투자회사)?)\s*에\s*대한\s*주식(?:취득|양수|처분|양도)",
+        r"(주식회사\s*[A-Za-z0-9가-힣&\.\-\s]{2,180})\s*에\s*대한\s*주식(?:취득|양수|처분|양도)",
+    ]
+    for pat in narrative_patterns:
+        m = re.search(pat, txt, flags=re.I | re.S)
+        if not m:
+            continue
+        v = re.sub(r"\s+", " ", m.group(1)).strip(" \t:-,")
         if not _is_bad_issuer(v):
             return v
     return pd.NA
@@ -674,6 +937,310 @@ def _extract_issuer_from_text(raw_text: str) -> Any:
 def _is_acquire_report_name(report_nm: Any) -> bool:
     s = str(report_nm or "")
     return ("취득결정" in s) or ("양수결정" in s)
+
+
+def _normalize_company_token(token: Any) -> Optional[str]:
+    if token is None:
+        return None
+    s = html.unescape(str(token))
+    s = s.replace("&cr", " ").replace("&#13;", " ").replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip(" \t,;:|/-")
+    if not s:
+        return None
+    s = re.sub(r"^[\*\-\u2022·]+\s*", "", s)
+
+    # Handle field blobs such as:
+    # "*회사명: 주식회사 XXX *국적: 대한민국 *대표자: ..."
+    m_field = re.search(
+        r"(?:회사명(?:\(국적\))?|발행회사(?:\(회사명\))?)\s*[:：]\s*(?P<nm>.+?)(?=\s*(?:\*?\s*)?(?:국적|대표자|대표이사|자본금(?:\(원\))?|발행주식총수(?:\(주\))?|주요사업)\s*[:：]|$)",
+        s,
+        flags=re.I,
+    )
+    if m_field:
+        s = m_field.group("nm").strip()
+
+    s = re.sub(r"^\(?\s*(국적|대표자|대표이사|회사명(?:\(국적\))?)\s*\)?\s*", "", s)
+    s = re.sub(r"^\(?\s*(발행회사(?:\(회사명\))?)\s*\)?\s*[:：]?\s*", "", s)
+    s = re.sub(
+        r"\s*(?:\*?\s*)?(?:국적|대표자|대표이사|자본금(?:\(원\))?|발행주식총수(?:\(주\))?|주요사업)\s*[:：].*$",
+        "",
+        s,
+    )
+    s = re.sub(r"\s*(?:대\s*표\s*이\s*사|대\s*표\s*자)\s*$", "", s)
+    s = re.sub(r"^\(?\s*가\s*칭\s*\)?\s*", "", s)
+    s = re.sub(r"\s*\(?\s*가\s*칭\s*\)?\s*$", "", s)
+    s = re.sub(r"^[\(\[]?\d+[\)\.]?\s*", "", s)
+    s = re.sub(r"\s*의?\s*총\s*\d+\s*개사.*$", "", s)
+    s = re.sub(r"\s*[\(\[\{]+\s*$", "", s)
+    if s.count("(") > s.count(")"):
+        while s.endswith("("):
+            s = s[:-1].rstrip()
+    s = re.sub(r"\s+", " ", s).strip(" \t,;:|/-")
+    if not s or _is_bad_issuer(s):
+        return None
+    return s
+
+
+def _has_company_hint(value: Any) -> bool:
+    s = str(value or "")
+    return bool(
+        re.search(
+            r"(주식회사|\(주\)|㈜|유한회사|유한공사|조합|Ltd\.?|Inc\.?|LLC|Corp\.?|Co\.?|S\.r\.o|S\.A\.|B\.V\.|PLC)",
+            s,
+            flags=re.I,
+        )
+    )
+
+
+def _issuer_quality_score(value: Any) -> int:
+    if _is_bad_issuer(value):
+        return -100
+    s = str(value or "").strip()
+    plain = re.sub(r"[^0-9A-Za-z가-힣]", "", s)
+    score = 0
+    if _has_company_hint(s):
+        score += 4
+    if re.search(r"[A-Za-z가-힣]", plain):
+        score += 1
+    if len(plain) >= 5:
+        score += 1
+    if re.search(r"(회사분할|분할등기|정정전|정정후|단위|금액|주식수|재무제표)", s):
+        score -= 4
+    if re.fullmatch(r"[가-힣]{2,4}", plain):
+        score -= 1
+    return score
+
+
+def _maybe_choose_better_issuer(current: Any, candidate: Any) -> Any:
+    if _is_bad_issuer(candidate):
+        return current
+    if _is_bad_issuer(current):
+        return candidate
+    cur_score = _issuer_quality_score(current)
+    cand_score = _issuer_quality_score(candidate)
+    if cand_score > (cur_score + 1):
+        return candidate
+    if _has_company_hint(candidate) and (not _has_company_hint(current)):
+        return candidate
+    return current
+
+
+def _issuer_dedup_key(value: Any) -> str:
+    nm = _normalize_company_token(value)
+    if not nm:
+        return ""
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", nm).lower()
+
+
+def _extract_multi_issuer_names(viewer_html: str, doc_raw_text: str) -> List[str]:
+    candidates: List[str] = []
+    source_texts: List[Tuple[str, str]] = []
+    if viewer_html:
+        source_texts.append((_markup_to_text(viewer_html), "viewer"))
+    if doc_raw_text:
+        source_texts.append((str(doc_raw_text), "doc"))
+
+    for txt, src_kind in source_texts:
+        if not txt:
+            continue
+        local_candidates: List[str] = []
+        body = ""
+        m_sec = re.search(
+            r"1\.\s*발행회사(?P<section>.*?)(?:\n\s*2\.\s*(?:처분|양도|취득|양수)내역|$)",
+            txt,
+            flags=re.S,
+        )
+        section = m_sec.group("section") if m_sec else txt
+        m_body = re.search(
+            r"(?:회사명(?:\(국적\))?)\s*(?P<body>.*?)(?:\n\s*(?:-\s*)?(?:\(?국적\)?|\(?대표자\)?|\(?대표이사\)?|\(?자본금(?:\(원\))?\)?|회사와\s*관계|발행주식총수)|$)",
+            section,
+            flags=re.S,
+        )
+        if m_body:
+            body = m_body.group("body")
+        if not body:
+            continue
+
+        body = re.sub(r"\s+", " ", body).strip()
+        multi_hint = bool(re.search(r"총\s*\d+\s*개사", body))
+        body = re.sub(r"\s*의?\s*총\s*\d+\s*개사.*$", "", body)
+
+        for name in re.findall(
+            r"(?:주식회사|㈜|\(주\))\s*[0-9A-Za-z가-힣·&\-\.\s]{1,120}(?:\([^)]{1,120}\))?",
+            body,
+        ):
+            if re.search(r"대\s*표\s*이\s*사|대\s*표\s*자", str(name)):
+                continue
+            nm = _normalize_company_token(name)
+            if not nm:
+                continue
+            if re.search(r"(회사분할|분할등기|취득금액|처분금액|주\d+\))", nm):
+                continue
+            local_candidates.append(nm)
+
+        if not local_candidates and multi_hint:
+            for part in re.split(r"\s*,\s*|\s+및\s+|\s+와\s+|\s+과\s+", body):
+                nm = _normalize_company_token(part)
+                if nm:
+                    local_candidates.append(nm)
+
+        # document raw text는 노이즈가 많아 '총 N개사' 근거가 있을 때만 다중 회사로 채택한다.
+        if src_kind == "doc" and not multi_hint:
+            continue
+        candidates.extend(local_candidates)
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        nm = _normalize_company_token(raw)
+        if not nm:
+            continue
+        key = re.sub(r"\s+", "", nm)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(nm)
+    return out if len(out) >= 2 else []
+
+
+def _company_match_keys(name: Any) -> set[str]:
+    s = _normalize_company_token(name)
+    if not s:
+        return set()
+    variants: List[str] = [s]
+    variants.append(re.sub(r"\([^)]*\)", " ", s))
+    variants.append(re.sub(r"^(주식회사|㈜|\(주\))\s*", "", s))
+    variants.append(re.sub(r"\s*(주식회사|㈜|\(주\))$", "", s))
+
+    keys: set[str] = set()
+    for one in variants:
+        txt = re.sub(r"\s+", " ", str(one)).strip()
+        if not txt:
+            continue
+        k = re.sub(r"[^0-9A-Za-z가-힣]", "", txt).lower()
+        if k:
+            keys.add(k)
+    return keys
+
+
+def _best_match_plan_item_index(
+    issuer_name: Any,
+    items: List[Dict[str, Any]],
+    used_idx: set[int],
+) -> Optional[int]:
+    issuer_keys = _company_match_keys(issuer_name)
+    if not issuer_keys:
+        return None
+
+    best_idx: Optional[int] = None
+    best_score = -1
+    for idx, it in enumerate(items):
+        if idx in used_idx:
+            continue
+        item_keys = _company_match_keys(it.get("name"))
+        if not item_keys:
+            continue
+        score = -1
+        if issuer_keys & item_keys:
+            score = 100
+        else:
+            for ik in issuer_keys:
+                for jk in item_keys:
+                    if len(ik) < 3 or len(jk) < 3:
+                        continue
+                    if ik in jk or jk in ik:
+                        score = max(score, min(len(ik), len(jk)))
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    if best_score < 3:
+        return None
+    return best_idx
+
+
+def _apply_plan_items_to_rows(
+    *,
+    rows: List[Dict[str, Any]],
+    items: List[Dict[str, Any]],
+    sign: int,
+) -> set[int]:
+    used_idx: set[int] = set()
+    if not rows or not items:
+        return used_idx
+
+    for row in rows:
+        idx = _best_match_plan_item_index(row.get("iscmp_cmpnm"), items, used_idx)
+        if idx is None:
+            continue
+        it = items[idx]
+        row["trfdtl_stkcnt"] = _signed_num(it.get("shares", pd.NA), sign=sign)
+        row["trfdtl_trfprc"] = _signed_num(it.get("amt", pd.NA), sign=sign)
+        row["source"] = (str(row.get("source", "INIT")) + "+NOTE_ITEM_MAP").strip("+")
+        used_idx.add(idx)
+
+    # 이름 매칭이 어렵지만 개수는 동일한 다중행 케이스는 순서로 보정한다.
+    if len(used_idx) == 0 and len(rows) == len(items) and len(rows) > 1:
+        for idx, row in enumerate(rows):
+            it = items[idx]
+            row["trfdtl_stkcnt"] = _signed_num(it.get("shares", pd.NA), sign=sign)
+            row["trfdtl_trfprc"] = _signed_num(it.get("amt", pd.NA), sign=sign)
+            row["source"] = (str(row.get("source", "INIT")) + "+NOTE_ITEM_SEQ_MAP").strip("+")
+            used_idx.add(idx)
+
+    return used_idx
+
+
+def _expand_base_rows_for_multi_issuers(
+    *,
+    base_row: Dict[str, Any],
+    viewer_html: str,
+    doc_raw_text: str,
+) -> List[Dict[str, Any]]:
+    names = _extract_multi_issuer_names(viewer_html=viewer_html, doc_raw_text=doc_raw_text)
+    if not names:
+        return [base_row]
+
+    corp_keys = _company_match_keys(base_row.get("corp_name"))
+    base_issuer_keys = _company_match_keys(base_row.get("iscmp_cmpnm"))
+    filtered = []
+    for nm in names:
+        nm_keys = _company_match_keys(nm)
+        if corp_keys and (nm_keys & corp_keys):
+            continue
+        filtered.append(nm)
+    if filtered:
+        names = filtered
+
+    submitter_keys = _company_match_keys(_extract_submitter_from_title(viewer_html))
+    filtered_by_submitter = []
+    for nm in names:
+        nm_keys = _company_match_keys(nm)
+        if submitter_keys and (nm_keys & submitter_keys):
+            continue
+        filtered_by_submitter.append(nm)
+    if filtered_by_submitter:
+        names = filtered_by_submitter
+
+    if len(names) < 2:
+        # If only one clean issuer is left and current issuer is bad/self-like, override base row.
+        if len(names) == 1 and (
+            _is_bad_issuer(base_row.get("iscmp_cmpnm"))
+            or (corp_keys and base_issuer_keys and (base_issuer_keys & corp_keys))
+        ):
+            r = base_row.copy()
+            r["iscmp_cmpnm"] = names[0]
+            r["source"] = (str(base_row.get("source", "INIT")) + "+MULTI_ISSUER_SINGLE").strip("+")
+            return [r]
+        return [base_row]
+
+    out: List[Dict[str, Any]] = []
+    for nm in names:
+        r = base_row.copy()
+        r["iscmp_cmpnm"] = nm
+        # 기본값은 본문의 수치를 유지하고, 이후 NOTE_ITEM 매핑이 있으면 회사별 값으로 덮어쓴다.
+        r["source"] = (str(base_row.get("source", "INIT")) + "+MULTI_ISSUER").strip("+")
+        out.append(r)
+    return out
 
 
 def _parse_plan_items(note_text: str) -> List[Dict[str, Any]]:
@@ -685,38 +1252,163 @@ def _parse_plan_items(note_text: str) -> List[Dict[str, Any]]:
     t = re.sub(r"\n{2,}", "\n", t).strip()
 
     patterns = [
-        re.compile(
+        (
+            re.compile(
             r"""(?mix)
             ^\s*(\d+)\.\s*
             ([^\n\d]{1,120}?)\s+
             (\d[\d,]*)\s*주(?:식)?\s*
-            (?:취득(?:예정)?금액|취득\s*금액|금액)\s*
+            (?:(?:취득|양수|양도|처분)(?:예정)?금액|(?:취득|양수|양도|처분)\s*금액|금액)\s*
             (\d[\d,]*)\s*원\s*$
             """
+            ),
+            "shares_first",
         ),
-        re.compile(
+        (
+            re.compile(
             r"""(?ix)
             (\d+)\.\s*
             ([가-힣A-Za-z0-9&\.\-\(\)·\s]{1,120}?)\s+
             (\d[\d,]*)\s*주(?:식)?\s*
-            (?:취득(?:예정)?금액|취득\s*금액|금액)\s*
+            (?:(?:취득|양수|양도|처분)(?:예정)?금액|(?:취득|양수|양도|처분)\s*금액|금액)\s*
             (\d[\d,]*)\s*원
             """
+            ),
+            "shares_first",
+        ),
+        (
+            re.compile(
+            r"""(?ix)
+            (\d+)\.\s*
+            ([가-힣A-Za-z0-9&\.\-\(\)·\s]{1,140}?)\s*
+            (?:[:\-]\s*|\s+)
+            (?:(?:주식수|수량)\s*)?(\d[\d,]*)\s*주(?:식)?\s*
+            (?:(?:취득|양수|양도|처분)?(?:예정)?금액|금액)\s*
+            (\d[\d,]*)\s*원
+            """
+            ),
+            "shares_first",
+        ),
+        (
+            re.compile(
+            r"""(?ix)
+            (\d+)\.\s*
+            ([가-힣A-Za-z0-9&\.\-\(\)·\s]{1,140}?)\s*
+            (?:[:\-]\s*|\s+)
+            (?:(?:취득|양수|양도|처분)?(?:예정)?금액|금액)\s*
+            (\d[\d,]*)\s*원\s*
+            (?:(?:주식수|수량)\s*)?(\d[\d,]*)\s*주(?:식)?
+            """
+            ),
+            "amount_first",
+        ),
+        (
+            re.compile(
+            r"""(?ix)
+            (\d+)\.\s*
+            ([가-힣A-Za-z0-9&\.\-\(\)·\s]{1,160}?)\s*
+            (?:[:\-]\s*|\s+)
+            (?:(?:취득|양수|양도|처분)?(?:예정)?금액|금액)\s*
+            (\d[\d,]*)\s*원
+            """
+            ),
+            "amount_only",
         ),
     ]
 
     out: List[Dict[str, Any]] = []
-    seen = set()
-    for p in patterns:
-        for seq, name, shares, amt in p.findall(t):
+    seen: set[tuple[str, Optional[int], Optional[int]]] = set()
+    for p, order in patterns:
+        for m in p.findall(t):
+            if order == "amount_only":
+                seq, name, v3 = m
+                sh: Optional[int] = None
+                am: Optional[int] = int(str(v3).replace(",", ""))
+            else:
+                seq, name, v3, v4 = m
+                g3 = int(str(v3).replace(",", ""))
+                g4 = int(str(v4).replace(",", ""))
+                if order == "amount_first":
+                    am, sh = g3, g4
+                else:
+                    sh, am = g3, g4
             nm = re.sub(r"\s+", " ", name).strip(" -:\t\r\n")
-            sh = int(str(shares).replace(",", ""))
-            am = int(str(amt).replace(",", ""))
-            key = (int(seq), nm, sh, am)
+            nm = re.sub(r"^[\(\[]?\d+[\)\.]?\s*", "", nm)
+            key = (nm, sh, am)
             if key in seen:
                 continue
             seen.add(key)
             out.append({"line_no": int(seq), "name": nm, "shares": sh, "amt": am})
+
+    # 번호 없는 문장형 라인 fallback
+    line_patterns = [
+        (
+            re.compile(
+                r"""(?ix)
+                ^
+                ([가-힣A-Za-z0-9&\.\-\(\)·\s]{2,140}?)\s+
+                (?:(?:주식수|수량)\s*)?(\d[\d,]*)\s*주(?:식)?\s*
+                (?:(?:취득|양수|양도|처분)?(?:예정)?금액|금액)\s*
+                (\d[\d,]*)\s*원
+                $
+                """
+            ),
+            "shares_first",
+        ),
+        (
+            re.compile(
+                r"""(?ix)
+                ^
+                ([가-힣A-Za-z0-9&\.\-\(\)·\s]{2,140}?)\s+
+                (?:(?:취득|양수|양도|처분)?(?:예정)?금액|금액)\s*
+                (\d[\d,]*)\s*원\s*
+                (?:(?:주식수|수량)\s*)?(\d[\d,]*)\s*주(?:식)?
+                $
+                """
+            ),
+            "amount_first",
+        ),
+        (
+            re.compile(
+                r"""(?ix)
+                ^
+                ([가-힣A-Za-z0-9&\.\-\(\)·\s]{2,160}?)\s+
+                (?:(?:취득|양수|양도|처분)?(?:예정)?금액|금액)\s*
+                (\d[\d,]*)\s*원
+                $
+                """
+            ),
+            "amount_only",
+        ),
+    ]
+    next_line_no = (max([x["line_no"] for x in out]) + 1) if out else 1
+    for ln in t.splitlines():
+        line = re.sub(r"\s+", " ", str(ln)).strip(" \t")
+        if not line:
+            continue
+        for p, order in line_patterns:
+            m = p.search(line)
+            if not m:
+                continue
+            name = re.sub(r"\s+", " ", m.group(1)).strip(" -:\t\r\n")
+            name = re.sub(r"^[\(\[]?\d+[\)\.]?\s*", "", name)
+            g2 = int(str(m.group(2)).replace(",", ""))
+            if order == "amount_only":
+                am = g2
+                sh = None
+            elif order == "amount_first":
+                g3 = int(str(m.group(3)).replace(",", ""))
+                am, sh = g2, g3
+            else:
+                g3 = int(str(m.group(3)).replace(",", ""))
+                sh, am = g2, g3
+            key = (name, sh, am)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"line_no": next_line_no, "name": name, "shares": sh, "amt": am})
+            next_line_no += 1
+            break
     out.sort(key=lambda x: x["line_no"])
     return out
 
@@ -748,7 +1440,14 @@ def _pick_best_note_from_sources(
     for c in candidates:
         sec = _extract_section9_text(c)
         n_items = len(re.findall(r"\d+\.\s*.+?\d[\d,]*\s*주.*?\d[\d,]*\s*원", sec, flags=re.S))
-        score = n_items * 10
+        n_amount_only = len(
+            re.findall(
+                r"\d+\.\s*[^\n]{1,180}?(?:취득|양수|양도|처분)?(?:예정)?금액\s*\d[\d,]*\s*원",
+                sec,
+                flags=re.S,
+            )
+        )
+        score = (n_items * 10) + (n_amount_only * 7)
         for kw in ("기타 투자판단", "취득금액", "한도내 신규 투자", "총", "주", "원"):
             if kw in sec:
                 score += 2
@@ -1116,6 +1815,7 @@ def extract_transfer_decision_from_viewer_url(
     seed_row: Optional[Union[Dict[str, Any], pd.Series]] = None,
     session: Optional[requests.Session] = None,
     request_interval_sec: float = 0.0,
+    out_meta: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     rcp_no = _extract_rcp_no(viewer_url)
     seed = _seed_to_dict(seed_row)
@@ -1148,12 +1848,16 @@ def extract_transfer_decision_from_viewer_url(
     try:
         if verbose:
             print(f"[1] viewer HTML 파싱 시작: rcp_no={rcp_no}")
+        viewer_meta: Dict[str, Any] = {}
         viewer_html, src = _fetch_viewer_html_by_rcpno(
             rcp_no,
             sess,
             timeout=timeout,
             request_interval_sec=request_interval_sec,
+            out_meta=viewer_meta,
         )
+        if out_meta is not None:
+            out_meta.update(viewer_meta)
         if viewer_html:
             parsed = _extract_fields_from_html_text(viewer_html) or {}
             skip_identity = {"corp_name", "corp_code", "corp_cls", "flr_nm", "pblntf_ty", "rcept_no", "rcept_dt"}
@@ -1169,10 +1873,12 @@ def extract_transfer_decision_from_viewer_url(
                 if not _is_empty_like(title_submitter):
                     row["corp_name"] = title_submitter
 
-            if _is_bad_issuer(row.get("iscmp_cmpnm")):
-                issuer = _extract_issuer_from_viewer_table(viewer_html)
-                if not _is_bad_issuer(issuer):
-                    row["iscmp_cmpnm"] = issuer
+            # Priority 1: issuer adjacent to label in viewer table/text.
+            issuer_tbl = _extract_issuer_from_viewer_table(viewer_html)
+            if not _is_bad_issuer(issuer_tbl):
+                row["iscmp_cmpnm"] = issuer_tbl
+            else:
+                row["iscmp_cmpnm"] = _maybe_choose_better_issuer(row.get("iscmp_cmpnm"), issuer_tbl)
 
         if verbose:
             got = sum(1 for k in LEGACY_CORE_FIELDS if not pd.isna(row.get(k)))
@@ -1238,21 +1944,39 @@ def extract_transfer_decision_from_viewer_url(
                     row[k] = v
             row["source"] = (str(row["source"]) + "+DOC").strip("+")
 
-            if _is_bad_issuer(row.get("iscmp_cmpnm")):
-                issuer = _extract_issuer_from_viewer_table(viewer_html)
-                if _is_bad_issuer(issuer) and doc_raw_text:
-                    issuer = _extract_issuer_from_text(doc_raw_text)
+            # Keep label-adjacent extraction as primary decision rule.
+            issuer = _extract_issuer_from_viewer_table(viewer_html)
+            if not _is_bad_issuer(issuer):
+                row["iscmp_cmpnm"] = issuer
+            elif doc_raw_text:
+                issuer = _extract_issuer_from_text(doc_raw_text)
                 if not _is_bad_issuer(issuer):
                     row["iscmp_cmpnm"] = issuer
+                else:
+                    row["iscmp_cmpnm"] = _maybe_choose_better_issuer(row.get("iscmp_cmpnm"), issuer)
         except Exception as e:
             if verbose:
                 print(f"[WARN] document 구조화 파싱 실패: {e}")
             row["source"] = (str(row["source"]) + "+DOC_PARSE_FAIL").strip("+")
 
+    issuer = _extract_issuer_from_text(doc_raw_text)
+    row["iscmp_cmpnm"] = _maybe_choose_better_issuer(row.get("iscmp_cmpnm"), issuer)
+    combo_text = _markup_to_text(viewer_html)
+    if doc_raw_text:
+        combo_text = f"{combo_text}\n{doc_raw_text}"
+    issuer = _extract_issuer_from_text(combo_text)
+    row["iscmp_cmpnm"] = _maybe_choose_better_issuer(row.get("iscmp_cmpnm"), issuer)
     if _is_bad_issuer(row.get("iscmp_cmpnm")):
-        issuer = _extract_issuer_from_text(doc_raw_text)
-        if not _is_bad_issuer(issuer):
-            row["iscmp_cmpnm"] = issuer
+        row["iscmp_cmpnm"] = pd.NA
+
+    # Fallback: when core numeric fields are missing, recover from flattened text labels.
+    combo_text = _markup_to_text(viewer_html)
+    if doc_raw_text:
+        combo_text = f"{combo_text}\n{doc_raw_text}"
+    num_fallback = _extract_amount_qty_from_text(combo_text)
+    for k in ("trfdtl_trfprc", "trfdtl_stkcnt"):
+        if pd.isna(_num_or_na_keep_sign(row.get(k))) and (k in num_fallback):
+            row[k] = num_fallback[k]
 
     for c in LEGACY_NUM_COLS:
         if c in row:
@@ -1279,9 +2003,18 @@ def extract_transfer_decision_from_viewer_url(
         base["trfdtl_stkcnt"] = _signed_num(base.get("trfdtl_stkcnt"), sign=signed)
     if "trfdtl_trfprc" in base:
         base["trfdtl_trfprc"] = _signed_num(base.get("trfdtl_trfprc"), sign=signed)
-    rows.append(base)
+    rows.extend(
+        _expand_base_rows_for_multi_issuers(
+            base_row=base,
+            viewer_html=viewer_html,
+            doc_raw_text=doc_raw_text,
+        )
+    )
+    used_item_idx = _apply_plan_items_to_rows(rows=rows, items=items, sign=signed)
 
-    for it in items:
+    for idx, it in enumerate(items):
+        if idx in used_item_idx:
+            continue
         r: Dict[str, Any] = {c: pd.NA for c in LEGACY_OUT_COLS}
         r["rcept_no"] = base.get("rcept_no")
         r["rcept_dt"] = base.get("rcept_dt")
@@ -1293,14 +2026,36 @@ def extract_transfer_decision_from_viewer_url(
         r["viewer_url"] = base.get("viewer_url")
         r["source"] = (str(base.get("source", "INIT")) + "+NOTE_PLAN").strip("+")
         r["iscmp_cmpnm"] = it["name"]
-        r["trfdtl_stkcnt"] = abs(it["shares"])
-        r["trfdtl_trfprc"] = abs(it["amt"])
+        r["trfdtl_stkcnt"] = _signed_num(it.get("shares"), sign=signed)
+        r["trfdtl_trfprc"] = _signed_num(it.get("amt"), sign=signed)
         r["trf_pp"] = "처분대금 재투자(취득계획)"
         r["bddd"] = base.get("bddd")
         r["trf_prd"] = base.get("trf_prd")
         rows.append(r)
 
     df = pd.DataFrame(rows)
+    if "iscmp_cmpnm" in df.columns:
+        df["iscmp_cmpnm"] = df["iscmp_cmpnm"].map(
+            lambda x: (_normalize_company_token(x) if not _is_bad_issuer(x) else pd.NA)
+        )
+        # one-report duplicate guard: same issuer parsed twice by minor text noise (&cr, entity, spacing)
+        if len(df) > 1:
+            df["_issuer_key"] = df["iscmp_cmpnm"].map(_issuer_dedup_key)
+            if "trfdtl_stkcnt" in df.columns:
+                df["_score_stk"] = df["trfdtl_stkcnt"].map(lambda x: 0 if pd.isna(_num_or_na_keep_sign(x)) else 1)
+            else:
+                df["_score_stk"] = 0
+            if "trfdtl_trfprc" in df.columns:
+                df["_score_amt"] = df["trfdtl_trfprc"].map(lambda x: 0 if pd.isna(_num_or_na_keep_sign(x)) else 1)
+            else:
+                df["_score_amt"] = 0
+            df["_score"] = df["_score_stk"] + df["_score_amt"]
+            df = df.sort_values(["_issuer_key", "_score"], ascending=[True, False]).drop_duplicates(
+                subset=["rcept_no", "_issuer_key"],
+                keep="first",
+            )
+            df = df.drop(columns=["_issuer_key", "_score_stk", "_score_amt", "_score"], errors="ignore")
+
     for c in LEGACY_NUM_COLS:
         if c in df.columns:
             df[c] = df[c].map(_num_or_na_keep_sign)
@@ -1687,29 +2442,42 @@ class CorporateHoldingsModule:
         if end_year is None:
             end_year = int(end[:4])
 
+        def _safe_df(name: str, fn) -> pd.DataFrame:
+            try:
+                return fn()
+            except Exception as exc:
+                print(f"[WARN] {name} failed corp_code={corp_code}: {exc}")
+                return _empty_output_df()
+
         if include_periodic_status:
             otr_frames: list[pd.DataFrame] = []
             for year in range(int(start_year), int(end_year) + 1):
                 for reprt_code in reprt_codes:
-                    otr_frames.append(
-                        self.fetch_other_corp_investment_status_df(
+                    one = _safe_df(
+                        f"other_corp_investment_status[{year}-{reprt_code}]",
+                        lambda y=year, rc=reprt_code: self.fetch_other_corp_investment_status_df(
                             corp_code=corp_code,
-                            bsns_year=year,
-                            reprt_code=str(reprt_code),
-                        )
+                            bsns_year=y,
+                            reprt_code=str(rc),
+                        ),
                     )
+                    if not one.empty:
+                        otr_frames.append(one)
             df_otr = pd.concat(otr_frames, ignore_index=True) if otr_frames else _empty_output_df()
         else:
             df_otr = _empty_output_df()
-        if include_majorstock_status:
-            df_major = self.fetch_majorstock_status_df(corp_code)
-        else:
-            df_major = _empty_output_df()
-        df_inh = self.fetch_inh_decision_df(corp_code, bgn, end)
-        df_trf = self.fetch_trf_decision_df(corp_code, bgn, end)
-        df_extr = self.fetch_stock_exchange_decision_df(corp_code, bgn, end)
+        df_major = (
+            _safe_df("majorstock_status", lambda: self.fetch_majorstock_status_df(corp_code))
+            if include_majorstock_status else _empty_output_df()
+        )
+        df_inh = _safe_df("inh_decision", lambda: self.fetch_inh_decision_df(corp_code, bgn, end))
+        df_trf = _safe_df("trf_decision", lambda: self.fetch_trf_decision_df(corp_code, bgn, end))
+        df_extr = _safe_df("stock_exchange_decision", lambda: self.fetch_stock_exchange_decision_df(corp_code, bgn, end))
         df_note = (
-            self.fetch_transfer_note_plan_df(corp_code, bgn, end, max_reports=max_note_reports)
+            _safe_df(
+                "transfer_note_plan",
+                lambda: self.fetch_transfer_note_plan_df(corp_code, bgn, end, max_reports=max_note_reports),
+            )
             if include_transfer_note_plan else _empty_output_df()
         )
 

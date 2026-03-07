@@ -13,8 +13,12 @@ class GraphQuery(BaseModel):
     highlight_hops: int = Field(default=1, ge=0, le=3)
     max_edges: int = Field(default=50, ge=1, le=50)
     db_limit: int | None = Field(default=None, ge=1, le=500000)
+    history_limit: int = Field(default=500, ge=1, le=5000)
     include_periodic_status: bool = False
     include_majorstock_status: bool = False
+    include_figure: bool = True
+    include_history: bool = True
+    include_top_edges: bool = True
 
 
 class TopEdge(BaseModel):
@@ -31,7 +35,10 @@ class GraphResponse(BaseModel):
     edges_shown: int
     status_text: str
     figure: dict[str, Any]
+    nodes: list[str] = Field(default_factory=list)
+    edges: list[TopEdge] = Field(default_factory=list)
     top_edges: list[TopEdge]
+    investing_history: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class StockOptionsResponse(BaseModel):

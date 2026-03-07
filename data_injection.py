@@ -363,9 +363,80 @@ def _normalize_target_name(value: Any) -> Optional[str]:
     if text is None:
         return None
     compact = re.sub(r"\s+", "", text)
+    compact = (
+        compact.replace("（", "(")
+        .replace("）", ")")
+        .replace("［", "[")
+        .replace("］", "]")
+        .replace("｛", "{")
+        .replace("｝", "}")
+    )
+    core = re.sub(r"^[\(\[\{<]+|[\)\]\}>]+$", "", compact)
+    compact_plain = re.sub(r"[^0-9A-Za-z가-힣]", "", compact)
+    core_plain = re.sub(r"[^0-9A-Za-z가-힣]", "", core)
     if not compact:
         return None
     if TARGET_PLACEHOLDER_RE.fullmatch(compact):
+        return None
+    if compact_plain in {
+        "회사명",
+        "회사명국적",
+        "기업명",
+        "법인명",
+        "발행회사",
+        "대표자",
+        "대표이사",
+        "대표자명",
+        "대표이사명",
+        "국적",
+        "성명",
+        "회사와관계",
+        "금액",
+        "금액원",
+        "금액백만원",
+        "취득금액",
+        "취득금액원",
+        "처분금액",
+        "처분금액원",
+        "양수금액",
+        "양수금액원",
+        "양도금액",
+        "양도금액원",
+        "주식수",
+        "주식수주",
+        "취득주식수",
+        "취득주식수주",
+        "처분주식수",
+        "처분주식수주",
+        "양수주식수",
+        "양수주식수주",
+        "양도주식수",
+        "양도주식수주",
+        "출자사재무제표",
+        "발행회사의요약재무상황",
+        "합계",
+        "총계",
+        "소계",
+        "및",
+        "와",
+        "과",
+    }:
+        return None
+    if compact in {",", ".", "-", "/", "&"}:
+        return None
+    if re.fullmatch(r"[-,./|&]+", compact):
+        return None
+    if re.fullmatch(r"\d[\d,]*(?:\.\d+)?", compact):
+        return None
+    if re.fullmatch(r"(?:취득|처분|양수|양도)?금액(?:원|백만원)?", compact_plain):
+        return None
+    if re.fullmatch(r"(?:취득|처분|양수|양도)?주식수(?:주)?", compact_plain):
+        return None
+    if compact_plain.endswith("재무제표"):
+        return None
+    if not re.search(r"[A-Za-z가-힣]", compact_plain):
+        return None
+    if core_plain in {"대표자", "대표이사", "대표자명", "대표이사명", "국적", "회사와관계"}:
         return None
     return text
 
@@ -399,16 +470,11 @@ def _extract_family_rcept_nos(main_html: str) -> list[str]:
     return sorted(out)
 
 
-def _fetch_family_html_payload(
-    session: requests.Session,
+def _build_family_payload_from_main_html(
+    *,
     rcept_no: str,
-    timeout: int,
+    main_html: str,
 ) -> dict[str, Any]:
-    url = "https://dart.fss.or.kr/dsaf001/main.do"
-    resp = session.get(url, params={"rcpNo": rcept_no}, timeout=timeout)
-    resp.raise_for_status()
-    main_html = resp.text
-
     members = _extract_family_rcept_nos(main_html)
     if rcept_no not in members:
         members.append(rcept_no)
@@ -441,6 +507,19 @@ def _fetch_family_html_payload(
         "document_html_format": "HTML_MAIN",
         "document_html_entry_name": None,
     }
+
+
+def _fetch_family_html_payload(
+    session: requests.Session,
+    rcept_no: str,
+    timeout: int,
+) -> dict[str, Any]:
+    url = "https://dart.fss.or.kr/dsaf001/main.do"
+    resp = session.get(url, params={"rcpNo": rcept_no}, timeout=timeout)
+    resp.raise_for_status()
+    main_html = resp.text
+
+    return _build_family_payload_from_main_html(rcept_no=rcept_no, main_html=main_html)
 
 
 def _decode_text_auto(data: bytes) -> str:
@@ -619,61 +698,147 @@ def _enrich_records_with_family_html(
         print("  -> family/html enrich skipped: no target rcept_no selected by enrich policy")
         return
 
-    sess = requests.Session()
-    sess.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
-    )
+    # Preloaded payloads (from earlier parsing step) can be reused to avoid duplicate main.do calls.
+    preloaded_by_rcept: dict[str, dict[str, Any]] = {}
+    preload_keys = [
+        "family_root_rcept_no",
+        "family_rcepts_json",
+        "family_member_count",
+        "family_alert_base_rcept_no",
+        "family_alert_is_fix",
+        "main_html_raw",
+        "main_html_sha256",
+        "main_html_fetched_at",
+        "main_html_type",
+        "document_html_raw",
+        "document_html_sha256",
+        "document_html_fetched_at",
+        "document_html_format",
+        "document_html_entry_name",
+        "document_xml_raw",
+        "document_xml_sha256",
+        "document_xml_fetched_at",
+        "document_xml_entry_name",
+    ]
+    for rec in records:
+        rcp = _extract_rcept_no_from_viewer_url(rec.get("viewer_url")) or _text_or_empty(rec.get("rcept_no"))
+        if rcp not in target_rcepts:
+            continue
+        slot = preloaded_by_rcept.setdefault(rcp, {})
+        for k in preload_keys:
+            v = rec.get(k)
+            if (k not in slot or _is_null_like(slot.get(k))) and not _is_null_like(v):
+                slot[k] = v
+
+    def _new_session() -> requests.Session:
+        s = requests.Session()
+        s.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Connection": "close",
+            }
+        )
+        return s
+
+    sess = _new_session()
     limiter = SlidingWindowRateLimiter(max_calls=max_rpm, period_sec=60.0)
     payload_by_rcept: dict[str, dict[str, Any]] = {}
     sorted_rcpts = sorted(target_rcepts)
-    ok_count = 0
-    fail_count = 0
+    family_ok_count = 0
+    family_fail_count = 0
+    family_skip_count = 0
+    xml_ok_count = 0
+    xml_fail_count = 0
+    xml_skip_count = 0
     for idx, rcp in enumerate(sorted_rcpts, start=1):
-        attempt = 0
-        while True:
-            limiter.acquire()
-            try:
-                payload = _fetch_family_html_payload(sess, rcp, timeout=timeout)
-                if include_document_xml and api_key:
-                    try:
-                        limiter.acquire()
-                        payload.update(
-                            _fetch_document_xml_payload(
-                                session=sess,
-                                api_key=api_key,
-                                rcept_no=rcp,
-                                timeout=timeout,
-                            )
-                        )
-                    except Exception as doc_exc:
-                        print(f"  -> WARN document.xml enrich failed rcept_no={rcp}: {doc_exc}")
-                payload_by_rcept[rcp] = payload
-                ok_count += 1
-                break
-            except Exception as exc:
-                attempt += 1
-                if attempt > max_retries:
-                    fail_count += 1
-                    print(f"  -> WARN family/html enrich failed rcept_no={rcp}: {exc}")
+        payload: dict[str, Any] = dict(preloaded_by_rcept.get(rcp, {}))
+        has_family_payload = (not _is_null_like(payload.get("main_html_raw"))) and (
+            not _is_null_like(payload.get("family_rcepts_json"))
+        )
+        has_xml_payload = not _is_null_like(payload.get("document_xml_raw"))
+
+        # family/main.do fetch
+        if has_family_payload:
+            family_skip_count += 1
+        else:
+            attempt = 0
+            while True:
+                limiter.acquire()
+                try:
+                    payload.update(_fetch_family_html_payload(sess, rcp, timeout=timeout))
+                    family_ok_count += 1
                     break
-                wait_retry = max(float(backoff_sec), 0.1) * (2 ** (attempt - 1)) + random.uniform(0.2, 0.8)
-                print(
-                    f"  -> WARN family/html transient error rcept_no={rcp} "
-                    f"(attempt {attempt}/{max_retries}), retry in {wait_retry:.1f}s: {exc}"
-                )
-                time.sleep(wait_retry)
+                except Exception as exc:
+                    attempt += 1
+                    if attempt > max_retries:
+                        family_fail_count += 1
+                        print(f"  -> WARN family/html enrich failed rcept_no={rcp}: {exc}")
+                        break
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+                    sess = _new_session()
+                    wait_retry = max(float(backoff_sec), 0.1) * (2 ** (attempt - 1)) + random.uniform(0.2, 0.8)
+                    print(
+                        f"  -> WARN family/html transient error rcept_no={rcp} "
+                        f"(attempt {attempt}/{max_retries}), retry in {wait_retry:.1f}s: {exc}"
+                    )
+                    time.sleep(wait_retry)
+
+        # document.xml fetch (independent from family success/failure)
+        if include_document_xml and api_key and not has_xml_payload:
+            attempt = 0
+            while True:
+                limiter.acquire()
+                try:
+                    payload.update(
+                        _fetch_document_xml_payload(
+                            session=sess,
+                            api_key=api_key,
+                            rcept_no=rcp,
+                            timeout=timeout,
+                        )
+                    )
+                    xml_ok_count += 1
+                    break
+                except Exception as exc:
+                    attempt += 1
+                    if attempt > max_retries:
+                        xml_fail_count += 1
+                        print(f"  -> WARN document.xml enrich failed rcept_no={rcp}: {exc}")
+                        break
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+                    sess = _new_session()
+                    wait_retry = max(float(backoff_sec), 0.1) * (2 ** (attempt - 1)) + random.uniform(0.2, 0.8)
+                    print(
+                        f"  -> WARN document.xml transient error rcept_no={rcp} "
+                        f"(attempt {attempt}/{max_retries}), retry in {wait_retry:.1f}s: {exc}"
+                    )
+                    time.sleep(wait_retry)
+        elif include_document_xml and api_key and has_xml_payload:
+            xml_skip_count += 1
+
+        if payload:
+            payload_by_rcept[rcp] = payload
         if idx < len(sorted_rcpts) and sleep_sec > 0:
             time.sleep(max(float(sleep_sec), 0.0))
 
     print(
         f"  -> family/html enrich summary: target_rcp={len(sorted_rcpts):,}, "
-        f"ok={ok_count:,}, fail={fail_count:,}, rpm={max_rpm}"
+        f"family_ok={family_ok_count:,}, family_skip={family_skip_count:,}, family_fail={family_fail_count:,}, "
+        f"xml_ok={xml_ok_count:,}, xml_skip={xml_skip_count:,}, xml_fail={xml_fail_count:,}, rpm={max_rpm}"
     )
 
     if not payload_by_rcept:
+        try:
+            sess.close()
+        except Exception:
+            pass
         return
 
     for rec in records:
@@ -682,6 +847,10 @@ def _enrich_records_with_family_html(
         if not payload:
             continue
         rec.update(payload)
+    try:
+        sess.close()
+    except Exception:
+        pass
 
 
 def _upsert_rows(conn: pymysql.connections.Connection, layout: DbLayout, records: list[dict[str, Any]]) -> int:

@@ -16,7 +16,7 @@ body {
 .page {
   width: min(1400px, 96vw);
   margin: 20px auto;
-  padding: 16px 18px 22px;
+  padding: 16px 18px 24px;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.9);
   border: 1px solid #dbe4ff;
@@ -30,6 +30,7 @@ h2 {
 .controls {
   display: grid;
   gap: 12px;
+  margin-bottom: 8px;
 }
 
 .control-row {
@@ -49,6 +50,15 @@ label {
 label.grow {
   flex: 1;
   min-width: 280px;
+}
+
+.checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  margin-top: 22px;
+  user-select: none;
 }
 
 input[type="text"],
@@ -83,9 +93,80 @@ button:disabled {
 }
 
 .status {
-  margin: 12px 0;
+  margin: 12px 0 10px;
   min-height: 24px;
   font-size: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.history-table-wrap {
+  margin: 10px 0 14px;
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.history-table thead th {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  z-index: 1;
+}
+
+.history-table th,
+.history-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #e2e8f0;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.history-empty {
+  padding: 10px 12px;
+  color: #475569;
+  font-size: 13px;
+}
+
+.meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.meta-row > div {
+  padding: 6px 10px;
+  font-size: 13px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #f8fafc;
+}
+
+.top-edges {
+  margin: 10px 0 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  overflow: auto;
+  max-height: 220px;
+}
+
+.top-edges h3 {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 14px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
 }
 
 .error {
@@ -102,4 +183,3 @@ button:disabled {
     border-right: 0;
   }
 }
-

@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -1077,6 +1078,9 @@ def _insert_df(
         return 0
     table = _safe_table_name(table)
 
+    dec_limits = _load_decimal_limits_for_table(conn, table)
+    overflow_counts: dict[str, int] = {}
+
     data = []
     for rec in df[cols].to_dict(orient="records"):
         row = []
@@ -1086,6 +1090,11 @@ def _insert_df(
                 row.append(None)
             elif isinstance(v, pd.Timestamp):
                 row.append(str(v.date()))
+            elif c in dec_limits:
+                norm_v = _normalize_decimal_for_db(v, dec_limits[c][0], dec_limits[c][1])
+                if norm_v is None and v is not None and not (isinstance(v, float) and pd.isna(v)):
+                    overflow_counts[c] = overflow_counts.get(c, 0) + 1
+                row.append(norm_v)
             else:
                 row.append(v)
         data.append(tuple(row))
@@ -1100,7 +1109,71 @@ def _insert_df(
             if progress_cb is not None:
                 progress_cb(inserted, len(data))
     conn.commit()
+    if overflow_counts:
+        msg = ", ".join([f"{k}={v:,}" for k, v in sorted(overflow_counts.items())])
+        print(f"[WARN] decimal overflow sanitized to NULL in {table}: {msg}")
     return inserted
+
+
+def _load_decimal_limits_for_table(
+    conn: pymysql.connections.Connection,
+    table: str,
+) -> dict[str, tuple[int, int]]:
+    sql = """
+    SELECT COLUMN_NAME, NUMERIC_PRECISION, NUMERIC_SCALE
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = %s
+      AND DATA_TYPE = 'decimal'
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (table,))
+        rows = cur.fetchall()
+
+    out: dict[str, tuple[int, int]] = {}
+    for r in rows:
+        name = _to_str(r.get("COLUMN_NAME"))
+        if not name:
+            continue
+        p = r.get("NUMERIC_PRECISION")
+        s = r.get("NUMERIC_SCALE")
+        if p is None or s is None:
+            continue
+        out[name] = (int(p), int(s))
+    return out
+
+
+def _normalize_decimal_for_db(value: Any, precision: int, scale: int) -> Optional[Any]:
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.replace(",", "")
+    try:
+        dec = Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+
+    # decimal(precision, scale): integer digits <= precision - scale, fraction digits <= scale
+    txt = format(dec.copy_abs(), "f")
+    if "." in txt:
+        int_part, frac_part = txt.split(".", 1)
+        frac_part = frac_part.rstrip("0")
+    else:
+        int_part, frac_part = txt, ""
+
+    int_digits = len(int_part.lstrip("0")) or 1
+    frac_digits = len(frac_part)
+    if int_digits > (precision - scale):
+        return None
+    if frac_digits > scale:
+        # keep deterministic behavior: not rounding ambiguous parsed amounts
+        return None
+
+    return int(dec) if scale == 0 else dec
 
 
 def _load_table_columns(conn: pymysql.connections.Connection, table: str) -> set[str]:

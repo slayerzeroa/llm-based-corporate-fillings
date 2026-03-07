@@ -15,6 +15,8 @@ def get_connection() -> pymysql.connections.Connection:
         database=s.db_name,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=3,
+        read_timeout=30,
+        write_timeout=30,
         autocommit=True,
     )
-

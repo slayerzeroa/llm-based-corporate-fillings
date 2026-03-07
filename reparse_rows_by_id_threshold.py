@@ -51,39 +51,21 @@ def _norm_rcept_no(value: Any) -> str:
     return m.group(1) if m else ""
 
 
-def _resolve_seed_sql(sql_text: Optional[str], sql_file: Optional[str]) -> str:
-    inline = str(sql_text or "").strip()
-    file_path = str(sql_file or "").strip()
-    if inline and file_path:
-        raise ValueError("Use only one of --missing-sql or --missing-sql-file.")
-    if file_path:
-        with open(file_path, "r", encoding="utf-8") as f:
-            inline = f.read()
-    sql = inline.strip().rstrip(";")
-    if not sql:
-        return ""
-    if not re.match(r"^\s*select\b", sql, flags=re.IGNORECASE):
-        raise ValueError("Custom seed SQL must be a SELECT statement.")
-    return sql
-
-
-def _build_missing_seed_df(
+def _build_seed_df_by_id_threshold(
     conn: pymysql.connections.Connection,
     source_db: str,
     source_table: str,
-    target_db: str,
-    target_table: str,
+    id_threshold: int,
     offset: int = 0,
     limit: Optional[int] = None,
 ) -> pd.DataFrame:
     src_db = _safe_ident(source_db)
     src_table = _safe_ident(source_table)
-    tgt_db = _safe_ident(target_db)
-    tgt_table = _safe_ident(target_table)
 
     sql = f"""
     SELECT
         f.rcept_no,
+        MIN(f.id) AS min_id,
         MAX(f.viewer_url) AS viewer_url,
         MAX(f.corp_cls) AS corp_cls,
         MAX(f.corp_code) AS corp_code,
@@ -93,17 +75,12 @@ def _build_missing_seed_df(
         MAX(f.pblntf_ty) AS pblntf_ty,
         MAX(f.rcept_dt) AS rcept_dt
     FROM `{src_db}`.`{src_table}` f
-    LEFT JOIN (
-        SELECT DISTINCT rcept_no
-        FROM `{tgt_db}`.`{tgt_table}`
-    ) d
-      ON d.rcept_no = f.rcept_no
-    WHERE d.rcept_no IS NULL
+    WHERE f.id > %s
     GROUP BY f.rcept_no
-    ORDER BY f.rcept_no DESC
+    ORDER BY MIN(f.id) ASC
     """
+    params: list[Any] = [int(id_threshold)]
 
-    params: list[Any] = []
     if limit is not None and int(limit) > 0:
         sql += " LIMIT %s OFFSET %s"
         params.extend([int(limit), max(int(offset), 0)])
@@ -115,24 +92,6 @@ def _build_missing_seed_df(
         cur.execute(sql, tuple(params))
         rows = cur.fetchall()
     return pd.DataFrame(rows)
-
-
-def _build_seed_df_from_sql(
-    conn: pymysql.connections.Connection,
-    seed_sql: str,
-) -> pd.DataFrame:
-    sql = _resolve_seed_sql(seed_sql, None)
-    if not sql:
-        return pd.DataFrame()
-    with conn.cursor() as cur:
-        cur.execute(sql)
-        rows = cur.fetchall()
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    if "rcept_no" not in out.columns:
-        raise ValueError("Custom seed SQL must include 'rcept_no' column.")
-    return out
 
 
 def _load_source_rows_by_rcept(
@@ -227,9 +186,6 @@ def _normalize_target_name(value: Any) -> Optional[str]:
         "합계",
         "총계",
         "소계",
-        "및",
-        "와",
-        "과",
     }:
         return None
     if compact in {",", ".", "-", "/", "&"}:
@@ -327,10 +283,8 @@ def _prepare_db_records_relaxed(df: pd.DataFrame) -> list[dict[str, Any]]:
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
-
         record["row_hash"] = _build_row_hash(record)
         records.append(record)
-
     return records
 
 
@@ -347,7 +301,6 @@ def _load_decimal_limits(
     cols = [c for c in columns if IDENT_RE.fullmatch(str(c))]
     if not cols:
         return {}
-
     placeholders = ", ".join(["%s"] * len(cols))
     sql = f"""
     SELECT column_name, numeric_precision, numeric_scale
@@ -377,12 +330,8 @@ def _decimal_fits(dec: Decimal, precision: int, scale: int) -> bool:
         frac_str = frac_str.rstrip("0")
     else:
         int_str, frac_str = s, ""
-
-    int_digits = len(int_str.lstrip("0"))
-    if int_digits == 0:
-        int_digits = 1
+    int_digits = len(int_str.lstrip("0")) or 1
     frac_digits = len(frac_str)
-
     if int_digits > (precision - scale):
         return False
     if frac_digits > scale:
@@ -397,7 +346,6 @@ def _sanitize_decimal_overflow(
     changed = 0
     if not records or not decimal_limits:
         return changed
-
     for rec in records:
         for col, (precision, scale) in decimal_limits.items():
             if col not in rec:
@@ -411,12 +359,10 @@ def _sanitize_decimal_overflow(
                 rec[col] = None
                 changed += 1
                 continue
-
             if not _decimal_fits(dec, precision, scale):
                 rec[col] = None
                 changed += 1
                 continue
-
             if scale == 0:
                 rec[col] = int(dec)
     return changed
@@ -440,52 +386,33 @@ def _dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Recollect missing rcept_no rows: find missing -> recollect by rcept_no -> upsert in batches."
+        description="Reparse rows where source id > threshold and save reparsed results into a separate table.",
     )
-    parser.add_argument("--source-db", default="fdm")
+    parser.add_argument("--source-db", default="dart")
     parser.add_argument("--target-db", default=None, help="Defaults to DB_NAME from .env.")
-    parser.add_argument("--source-table", default="dart_investment_events_copy")
-    parser.add_argument("--target-table", default="dart_investment_events_copy")
-    parser.add_argument("--dart-api-key", default=None)
-    parser.add_argument("--missing-sql", default=None, help="Custom SELECT SQL for seed rows (must include rcept_no).")
-    parser.add_argument("--missing-sql-file", default=None, help="Path to SQL file for custom seed rows.")
+    parser.add_argument("--source-table", default="dart_investment_events_copy_copy")
+    parser.add_argument("--target-table", default="dart_investment_events_reparsed_gt_18999")
+    parser.add_argument("--id-threshold", type=int, default=18999)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--create-target-like-source", action="store_true")
+    parser.add_argument("--truncate-target", action="store_true")
+    parser.add_argument("--dart-api-key", default=None)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--base-sleep", type=float, default=0.8)
     parser.add_argument("--query-sleep-sec", type=float, default=0.8)
-    parser.add_argument("--per-rcept-sleep-sec", type=float, default=0.0)
-    parser.add_argument("--batch-size", type=int, default=100, help="DB upsert batch size (records).")
-    parser.add_argument(
-        "--enrich-family-html",
-        dest="enrich_family_html",
-        action="store_true",
-        help="Also enrich family/main HTML columns.",
-    )
-    parser.add_argument(
-        "--no-enrich-family-html",
-        dest="enrich_family_html",
-        action="store_false",
-        help="Disable family/main HTML enrichment.",
-    )
+    parser.add_argument("--per-rcept-sleep-sec", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--enrich-family-html", dest="enrich_family_html", action="store_true")
+    parser.add_argument("--no-enrich-family-html", dest="enrich_family_html", action="store_false")
     parser.set_defaults(enrich_family_html=True)
-    parser.add_argument(
-        "--enrich-all-rows",
-        dest="enrich_all_rows",
-        action="store_true",
-        help="When enrichment is enabled, enrich all rows (default).",
-    )
-    parser.add_argument(
-        "--enrich-suspicious-only",
-        dest="enrich_all_rows",
-        action="store_false",
-        help="When enrichment is enabled, enrich only cancel/missing-target rows.",
-    )
+    parser.add_argument("--enrich-all-rows", dest="enrich_all_rows", action="store_true")
+    parser.add_argument("--enrich-suspicious-only", dest="enrich_all_rows", action="store_false")
     parser.set_defaults(enrich_all_rows=True)
-    parser.add_argument("--enrich-max-rpm", type=int, default=8)
+    parser.add_argument("--enrich-max-rpm", type=int, default=4)
     parser.add_argument("--enrich-max-retries", type=int, default=3)
-    parser.add_argument("--enrich-backoff-sec", type=float, default=3.0)
+    parser.add_argument("--enrich-backoff-sec", type=float, default=5.0)
     parser.add_argument("--enrich-sleep-sec", type=float, default=1.0)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -502,8 +429,8 @@ def main() -> None:
         raise RuntimeError("DART API key not found. Set DART_API_KEY/OPENDART_API_KEY or pass --dart-api-key.")
 
     db_cfg = _load_db_config()
-    target_db = _safe_ident(args.target_db or db_cfg.database)
     source_db = _safe_ident(args.source_db)
+    target_db = _safe_ident(args.target_db or db_cfg.database)
     source_table = _safe_ident(args.source_table)
     target_table = _safe_ident(args.target_table)
 
@@ -519,40 +446,57 @@ def main() -> None:
     )
 
     try:
-        seed_sql = _resolve_seed_sql(args.missing_sql, args.missing_sql_file)
-        if seed_sql:
-            seed_df = _build_seed_df_from_sql(conn=conn, seed_sql=seed_sql)
-            seed_mode = "custom_sql"
-        else:
-            seed_df = _build_missing_seed_df(
-                conn=conn,
-                source_db=source_db,
-                source_table=source_table,
-                target_db=target_db,
-                target_table=target_table,
-                offset=args.offset,
-                limit=args.limit,
-            )
-            seed_mode = "table_diff"
+        if args.create_target_like_source:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS `{target_db}`.`{target_table}` LIKE `{source_db}`.`{source_table}`"
+                )
+            conn.commit()
 
+        if args.truncate_target:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM `{target_db}`.`{target_table}`")
+                try:
+                    cur.execute(f"ALTER TABLE `{target_db}`.`{target_table}` AUTO_INCREMENT = 1")
+                except Exception:
+                    pass
+            conn.commit()
+
+        seed_df = _build_seed_df_by_id_threshold(
+            conn=conn,
+            source_db=source_db,
+            source_table=source_table,
+            id_threshold=args.id_threshold,
+            offset=args.offset,
+            limit=args.limit,
+        )
         if seed_df.empty:
-            print("[DONE] no missing rcept_no found.")
+            print("[DONE] no source rows for given id threshold.")
             return
 
         seed_df["rcept_no"] = seed_df["rcept_no"].map(_norm_rcept_no)
         seed_df = seed_df[seed_df["rcept_no"].str.match(RCEPT_RE, na=False)].copy()
+        seed_df = seed_df.drop_duplicates(subset=["rcept_no"], keep="first").reset_index(drop=True)
         if seed_df.empty:
-            print("[DONE] missing rows exist but no valid rcept_no.")
+            print("[DONE] rows found but no valid rcept_no.")
             return
 
-        seed_df = seed_df.drop_duplicates(subset=["rcept_no"], keep="first").reset_index(drop=True)
         print(
-            f"[LOAD] missing_rcept={len(seed_df):,}, seed_mode={seed_mode}, "
-            f"source={source_db}.{source_table}, target={target_db}.{target_table}, "
-            f"enrich_family_html={bool(args.enrich_family_html)}, enrich_all_rows={bool(args.enrich_all_rows)}"
+            f"[LOAD] source={source_db}.{source_table}, target={target_db}.{target_table}, "
+            f"id_threshold>{args.id_threshold}, rcepts={len(seed_df):,}"
         )
-        if not args.enrich_family_html:
-            print("[INFO] family/main_html enrichment is disabled; related columns will remain NULL.")
+
+        if not args.dry_run:
+            layout = _resolve_db_layout(conn=conn, db_name=target_db, table_name=target_table)
+            decimal_limits = _load_decimal_limits(
+                conn=conn,
+                db_name=target_db,
+                table_name=target_table,
+                columns=["trfdtl_trfprc", "trfdtl_stkcnt"],
+            )
+        else:
+            layout = None
+            decimal_limits = {}
 
         holdings = CorporateHoldingsModule(
             api_key=api_key,
@@ -562,19 +506,8 @@ def main() -> None:
             request_interval_sec=max(float(args.query_sleep_sec), 0.0),
         )
 
-        layout = None
-        decimal_limits: dict[str, tuple[int, int]] = {}
-        if not args.dry_run:
-            layout = _resolve_db_layout(conn=conn, db_name=target_db, table_name=target_table)
-            decimal_limits = _load_decimal_limits(
-                conn=conn,
-                db_name=target_db,
-                table_name=target_table,
-                columns=["trfdtl_trfprc", "trfdtl_stkcnt"],
-            )
-
-        buffer: list[dict[str, Any]] = []
         batch_size = max(int(args.batch_size), 1)
+        buffer: list[dict[str, Any]] = []
         processed = 0
         ok = 0
         failed = 0
@@ -584,7 +517,6 @@ def main() -> None:
             nonlocal buffer, db_affected_total
             if not buffer:
                 return
-
             records = _dedupe_records(buffer)
             overflow_fixed = _sanitize_decimal_overflow(records, decimal_limits)
             print(
@@ -621,7 +553,6 @@ def main() -> None:
             viewer_url = str(row.get("viewer_url") or f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}")
             print(f"[{i}/{len(seed_df)}] rcept_no={rcept_no}")
             processed += 1
-
             try:
                 meta: dict[str, Any] = {}
                 detail_df = extract_transfer_decision_from_viewer_url(
@@ -639,7 +570,6 @@ def main() -> None:
                     records = _prepare_db_records_relaxed(detail_df)
 
                 if not records:
-                    # fallback: source table row copy for this rcept
                     src_df = _load_source_rows_by_rcept(
                         conn=conn,
                         source_db=source_db,
@@ -650,16 +580,17 @@ def main() -> None:
                     if not records:
                         records = _prepare_db_records_relaxed(src_df)
 
+                if records and args.enrich_family_html:
+                    main_html = str(meta.get("main_html") or "").strip()
+                    if main_html:
+                        payload = _build_family_payload_from_main_html(
+                            rcept_no=rcept_no,
+                            main_html=main_html,
+                        )
+                        for rec in records:
+                            rec.update(payload)
+
                 if records:
-                    if args.enrich_family_html:
-                        main_html = str(meta.get("main_html") or "").strip()
-                        if main_html:
-                            payload = _build_family_payload_from_main_html(
-                                rcept_no=rcept_no,
-                                main_html=main_html,
-                            )
-                            for rec in records:
-                                rec.update(payload)
                     ok += 1
                     buffer.extend(records)
                     print(f"  -> records={len(records):,}, buffer={len(buffer):,}")
